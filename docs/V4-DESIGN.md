@@ -1,11 +1,18 @@
 # MeshCDN V4 Design Document
 
-**Version**: v0.4 (2026-04-27) — command system finalized
-**Status**: design complete, ready to implement
-**Purpose**: the "constitution" of the V4 rewrite — the final authority for all implementation decisions
+**Version**: v0.5 (2026-05) — reconciled with the shipped v4.0.20 implementation
+**Status**: implemented; this document now describes the system as built
+**Purpose**: the "constitution" of the V4 rewrite — the authority for all implementation decisions
 
-**Main changes in v0.4**:
-- Added **§A Overview of the three subsystems** (Skeleton / Muscle / Blood) as the overall architecture map
+**Main changes in v0.5** (post-implementation reconciliation):
+- Added **§13 AI assistant subsystem** — shipped in v4.0.17–v4.0.20 but absent from the original v0.4 design. The constitution now governs it.
+- Added **§14 file-based config I/O** — the Telegram export/import attachment workflow added in v4.0.19.
+- Revised **§3.7** to address multi-SAN certificate renewal (a gap the original renewal spec did not cover).
+- Marked **§12** as historical: it was the pre-implementation build plan; the work is now done.
+- Source-tree listings in §A.1 / §A.3 corrected to match the actual module layout (e.g. `command/types.go` holds the parser; `mesh/` is `client.go` / `coordinator.go` / `server.go` / `upgrade.go`; embedded source lives in `internal/version/source/`).
+
+**Earlier (v0.4, 2026-04-27)**:
+- Added **§A Overview of the three subsystems** (Skeleton / Muscle / Blood)
 - Command system formally fixed: strict four-segment form + mirror symmetry + object/binding two-layer abstraction
 - Added §8 the complete command geometry (command classes A/B/C, primary keys, merge rules, global port-protocol uniqueness)
 - Database schema outline, error-code taxonomy, and the confirmation UX nailed down together
@@ -303,6 +310,34 @@ Step 3: alert
 ```
 
 Implementation: an async task queue (in-process memory queue), not persisted. After a restart the next scan rediscovers automatically.
+
+## 3.7.1 Multi-SAN renewal (v0.5)
+
+A certificate may cover multiple names (a SAN list), either because it was
+issued for several domains or because a user uploaded a multi-SAN certificate.
+The renewal in §3.7 **must preserve the certificate's full SAN list**, not just
+its Common Name.
+
+```
+On renewing cert X:
+  names = X.san            ← the COMPLETE SAN list, not just X.subject (CN)
+  re-issue / regenerate for `names`
+  the replacement cert must cover every name X covered
+```
+
+Rationale: re-issuing for the CN alone silently "slims" a multi-name certificate
+down to a single name on its next renewal, which then fails to serve the dropped
+SANs. The selection algorithm (§3.6) would not catch this — it only checks
+coverage of the endpoint being selected, and the renewed cert still covers that
+one endpoint.
+
+> **Known limitation (v4.0.20)**: the shipped renewal path re-issues from the
+> certificate subject (CN) only; it does **not** yet preserve the full SAN list.
+> Externally uploaded multi-SAN certificates are therefore at risk of being
+> slimmed to their CN on the first auto-renewal (~6 days for LE). Storage and
+> selection already support multi-SAN; only the renewal issuance step needs the
+> fix above. Until fixed, multi-SAN certs that must not be slimmed should be of
+> source `upload` and re-uploaded before expiry, or excluded from auto-renewal.
 
 ## 3.8 Self-signed certificates
 
@@ -764,10 +799,17 @@ The bot/cli layer decides the UX based on Code — the Telegram side can use emo
 | Bot unreachable | automatic drift | purely manual takeover |
 | Peer list | separate Addition broadcast | folded into the config stream |
 | Source recoverable | not guaranteed | mandatory (commit hash + embed) |
+| AI assistant | read-only SQL question answering | natural-language → command suggestion, execute via confirm button (§13) |
 
 ---
 
 # §12 Implementation priority order
+
+> **Historical (v0.5 note)**: this was the pre-implementation build plan, in
+> dependency order. All steps below are now complete in v4.0.20. It is retained
+> as a record of how the build was sequenced, not as a description of current
+> status. Two subsystems shipped beyond this plan — see §13 (AI assistant) and
+> §14 (file-based config I/O).
 
 In dependency order:
 
@@ -786,9 +828,192 @@ After step 3 (about 2 weeks) there is an independently deployable single-node V4
 
 ---
 
+# §13 AI assistant subsystem (optional)
+
+> Added post-v0.4. Shipped across v4.0.17–v4.0.20. The original design document
+> did not anticipate this subsystem; this section brings it under the constitution.
+
+## 13.1 What it is — and what it deliberately is not
+
+The AI assistant is an **optional natural-language front-end to the command
+system**. Its single job is to translate a user's natural-language request into
+correct MeshCDN four-segment commands. It is **not** a database query engine and
+does **not** read live cluster state.
+
+This is a deliberate departure from the v3.x assistant, which ran read-only SQL
+against a config replica to answer questions. The V4 assistant works the other
+direction: it produces *commands*, never answers from a DB.
+
+It honors principle 6 (the program informs, the human decides) in the strongest
+form: **the AI only suggests; it never executes**. Suggested commands are wrapped
+in a markdown code block tagged `command`; the bot extracts these blocks and
+renders execute / cancel buttons. The user's tap is what executes — and that tap
+runs through the exact same command path (§8) and transaction (§2) as any typed
+command. Plain prose replies (no code block) are shown as-is.
+
+```
+user (@mention): "cache jpg and png on a.com for a week"
+        ↓
+LLM reply contains:  ```command
+                     /w cache img-7d patterns=*.jpg,*.png ttl=604800
+                     /w bind https://a.com:443 cache:img-7d
+                     ```
+        ↓
+bot renders [✅ Execute] [❌ Cancel]
+        ↓
+user taps Execute → commands run through the normal executor → synced cluster-wide
+```
+
+## 13.2 Triggering
+
+- An `@mention` of the bot in the Telegram group starts an AI conversation.
+- A reply to a bot message continues the conversation.
+- A message beginning with `/` is always treated as a direct command, never sent
+  to the AI.
+
+Non-Bot nodes never run the assistant (they have no Telegram client). The AI is
+purely a Bot-node convenience layer on top of the command system.
+
+## 13.3 Providers
+
+Six providers are supported, all reached over HTTP:
+
+```
+openai      api.openai.com                          (OpenAI Chat Completions shape)
+gemini      generativelanguage.googleapis.com       (Google OpenAI-compatible endpoint)
+grok        api.x.ai
+deepseek    api.deepseek.com
+qwen        dashscope.aliyuncs.com/compatible-mode  (Alibaba OpenAI-compatible)
+claude      api.anthropic.com/v1/messages           (native Messages shape)
+```
+
+Five of the six speak the OpenAI Chat Completions wire format and share a single
+implementation (`internal/ai/openai_compatible.go`); each has a thin file that
+only sets its base URL / auth header. Claude uses its native Messages shape
+(`x-api-key` + `anthropic-version` header + top-level `system` + content blocks)
+and has its own client. `assistant.go` holds the `NewProvider` factory and the
+conversation dispatch; `prompt.go` holds the system prompt (the command-grammar
+reference the LLM translates against).
+
+## 13.4 Configuration
+
+Per-provider API keys and per-provider model overrides live in
+`persistent/identity.json`:
+
+```json
+{
+  "ai_provider": "gemini",
+  "gemini_api_key": "AIza...",
+  "gemini_model": "gemini-2.5-flash-lite",
+  "openai_api_key": "sk-...",
+  "openai_model": "gpt-4o-mini"
+}
+```
+
+- `ai_provider` selects the **active** provider. Unset → AI disabled.
+- Each provider has its own key field and its own model field. An empty model
+  field falls back to `DefaultModel(provider)`. Keys for inactive providers are
+  retained, so switching providers does not lose credentials.
+
+Configured via the command system (class B-style operation scope):
+
+```
+/w ai provider <name>            switch active provider (openai/gemini/grok/claude/deepseek/qwen)
+/w ai key <key>                  set the key for the active provider
+/w ai key <provider>:<key>       set the key for a specific provider
+/w ai model <model>              set the model for the active provider
+/w ai model <provider>:<model>   set the model for a specific provider
+/d ai - -                        disable AI (clears ai_provider; keys kept)
+/d ai key <provider>             clear one provider's key
+/v ai - -                        show current AI config (keys masked)
+```
+
+## 13.5 Boundaries
+
+- The assistant cannot bypass the command layer. It cannot execute, cannot reach
+  the DB, cannot touch the mesh. It emits text; the user's button tap is the only
+  thing that turns text into action.
+- No patrol / autonomous health-check mode (the v3.x periodic patrol was dropped
+  in V4). Any future autonomous behavior must be re-justified against principle 6.
+- API keys are part of `identity.json` — treat them as secrets (the file already
+  holds the bot token). They are not synced via the config stream.
+
+---
+
+# §14 File-based configuration I/O (optional)
+
+> Added in v4.0.19; cert-upload routing refined in v4.0.20. A convenience layer
+> over the snapshot model (§4.2) and the command system (§8).
+
+## 14.1 Export
+
+`/v export - -` returns the full cluster configuration as a downloadable text
+file attachment (rather than only inline text). The file is the same
+command-sequence format as `snapshot.cmd` (§4.2):
+
+```
+filename: meshcdn-export-v<config_version>-<UTC-timestamp>.txt
+content:  one /w command per line, replayable verbatim
+```
+
+This makes "back up my config" and "move config to another cluster" a one-tap
+operation, and keeps the export human-readable and diff-able.
+
+## 14.2 Import
+
+A user uploads a `.txt` file to the Telegram group. The bot parses it and shows a
+**preview with a confirmation button** before anything runs — import is never
+silent.
+
+Parsing rules (`internal/bot/config_import.go`):
+
+- Strip a UTF-8 BOM if present; normalize CRLF → LF.
+- Skip blank lines and `#` comment lines.
+- `/v` (view) lines are dropped with a count (a config file should not contain
+  queries).
+- `/w` and `/d` lines are collected into a batch.
+- Malformed lines are reported, not silently ignored.
+
+The collected batch is summarized ("N writes, M deletes, K skipped") and held
+under a short import ID. The user taps:
+
+```
+[✅ Apply]  → runs the batch through the normal executor (§2 batch transaction,
+              one version increment, failures skipped-and-reported)
+[❌ Cancel] → discards the held batch
+```
+
+So import reuses the same atomic-batch semantics as any multi-line command paste;
+the file upload is just another way to deliver the batch.
+
+## 14.3 Disambiguation from certificate upload
+
+Both certificate upload (§3, `/w sslfile`) and config import accept file uploads
+over Telegram. They are disambiguated by **content sniffing** (v4.0.20), not by
+filename:
+
+- A file whose content contains a PEM block (`-----BEGIN ...`) is routed to the
+  certificate-upload path regardless of caption or extension. Cert vs. key is
+  decided by the PEM header (`CERTIFICATE` vs. `PRIVATE KEY`), and a cert/key
+  pair is validated (`tls.X509KeyPair`) before storage. Encrypted private keys
+  are rejected with guidance to decrypt first.
+- A non-PEM text file with an empty caption (or `/import`) is routed to config
+  import.
+
+This makes both upload flows caption-optional: drag the file in and the bot
+figures out what it is.
+
+## 14.4 Size guard
+
+Config import rejects files over 2 MB — a configuration export is virtually never
+that large, so an oversized upload is treated as a wrong-file mistake.
+
+---
+
 # Appendix A: change history
 
 - **v0.1** (2026-04-27): first version, protocol layer closed out
 - **v0.2** (2026-04-27): cert mechanism + IP endpoint + default page finalized
 - **v0.3** (2026-04-27): design philosophy adds principle 6; renewal simplified; two over-fallbacks removed; source self-containment added
 - **v0.4** (2026-04-27): added the three-subsystem overview (Skeleton/Muscle/Blood); command system formally fixed (strict four segments + mirror symmetry + object/binding + precision-first + global port-protocol uniqueness + confirmation UX); database schema outline; error-code taxonomy
+- **v0.5** (2026-05): post-implementation reconciliation with v4.0.20 — added §13 (AI assistant subsystem) and §14 (file-based config I/O), both shipped after v0.4 was written; revised §3.7 for multi-SAN renewal and recorded the current CN-only limitation; marked §12 as historical; corrected the source-tree listings to the actual module layout; added the AI-evolution row to §11
