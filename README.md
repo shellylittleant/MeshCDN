@@ -1,29 +1,22 @@
 # MeshCDN
 
 > **A self-hosted, peer-to-peer CDN with no central control plane.**
-> 一个完全自建、节点对等的分布式 CDN 系统。
 
 MeshCDN turns a handful of small VPS nodes (across any cloud provider, in any
 country) into a working CDN cluster — without depending on a single commercial
 provider, without a central control plane, and without exposing any management
 interface to the public internet.
 
-MeshCDN 把分散在各家云厂商、不同地区的小型 VPS 节点组成一个可用的 CDN
-集群——不依赖任何商业 CDN，没有中心化控制面，所有管理入口都不暴露在公网上。
-
-> **Note / 版本说明**
+> **Version note**
 > This is **MeshCDN v4**, a complete ground-up rewrite in Go. Earlier v2.x/v3.x
 > lines were a different codebase; their documentation is preserved under the
-> git tag [`archive/v3.1-docs`](../../tree/archive/v3.1-docs) for historical
-> reference. v4 shares the *concepts* (equal-peer mesh, Telegram control plane,
-> snapshot-replay config) but none of the v3 code.
->
-> 这是 **MeshCDN v4**——用 Go 从零重写的版本。v2.x/v3.x 是另一套代码库，其文档
-> 保留在 git tag `archive/v3.1-docs` 下供参考。v4 沿用了设计**理念**，但代码完全重写。
+> release [`v3.1.0`](../../releases/tag/v3.1.0) for historical reference. v4
+> shares the *concepts* (equal-peer mesh, Telegram control plane, snapshot-replay
+> config) but none of the v3 code.
 
 ---
 
-## Why this exists / 为什么要做这个
+## Why this exists
 
 Today's web depends heavily on a small number of commercial CDN providers. For
 most sites that's fine. But for operators who need:
@@ -43,51 +36,57 @@ cluster-wide config sync), but where every node is yours.
 
 ---
 
-## Core features / 核心特性
+## Core features
 
-- 🌐 **Equal-peer architecture** — Every node holds the full configuration and can
+- **Equal-peer architecture** — Every node holds the full configuration and can
   execute commands. No master, no leader election, no split-brain. The "Bot node"
-  (the one currently polling Telegram) can drift to any peer on failure.
-- 📱 **Telegram Bot as control plane** — All operations through a Telegram group
+  (the one currently polling Telegram) can be moved to any peer.
+- **Telegram Bot as control plane** — All operations through a Telegram group
   chat. Group history doubles as an audit log. No web panel, no SSH dependency,
   zero exposed admin surface.
-- 🧱 **Commands-as-configuration** — There is no separate "config format". The
+- **Commands-as-configuration** — There is no separate "config format". The
   command language *is* the configuration. Exporting produces a list of commands;
   restoring replays them; syncing broadcasts the difference.
-- 🔄 **Live cluster sync** — Changes broadcast in real time; missed updates
-  reconciled by a 1-minute heartbeat with version vectors.
-- 🔒 **Distributed SSL management** — Per-node IP certs and per-domain Let's
+- **Live cluster sync** — Changes broadcast in real time; missed updates
+  reconciled by a 1-minute heartbeat with a monotonic version counter.
+- **Distributed SSL management** — Per-node IP certs and per-domain Let's
   Encrypt certs (via [lego](https://github.com/go-acme/lego)). Upload your own
-  certs (auto-detected by PEM content, multi-SAN supported). Self-signed fallback.
-- 🤖 **Multi-provider AI assistant** (optional) — Ask in natural language. Supports
+  certs (auto-detected by PEM content, multi-SAN supported, cert/key pair
+  validated). Self-signed fallback.
+- **Multi-provider AI assistant** (optional) — Ask in natural language. Supports
   OpenAI, Gemini, Claude, DeepSeek, Grok, and Qwen. Read-only and advisory: it
-  suggests commands, you decide whether to run them. It never executes anything itself.
-- 📤 **File-based config I/O** — Export the whole cluster config as a `.txt`
+  suggests commands, you decide whether to run them. It never executes anything
+  itself. (You can ask in any language — the assistant replies in the language
+  you use, regardless of the documentation language.)
+- **File-based config I/O** — Export the whole cluster config as a `.txt`
   attachment; upload a `.txt` back to re-apply it (with a confirmation preview).
-- 🛡️ **Application-layer rules** — cache rules, header rewriting, redirects, and
+- **Application-layer rules** — cache rules, header rewriting, redirects, and
   IP / referer / rate / size-based defense.
-- 💾 **Atomic upgrades with rollback** — `runtime/` is rebuilt from `persistent/`
+- **Atomic upgrades with rollback** — `runtime/` is rebuilt from `persistent/`
   on every upgrade; the four persistent files are never destroyed.
-- 🪶 **Single static binary** — Go-compiled, builds to one `cdn-agent` binary.
+- **Single binary** — Go-compiled, builds to one `cdn-agent` binary.
 
 ---
 
-## Quick start (single node) / 快速开始（单节点）
+## Quick start (single node)
 
-There are no prebuilt release binaries yet — you build from source on the node
-itself. A helper script handles installing Go, fetching dependencies, building,
-and installing.
+There are no prebuilt release binaries yet — you build from source on the node.
+The repository already contains the full Go source, so the flow is: build the
+binary, then run the installer (which finds the binary you just built).
 
 ```bash
-# 1. Get the source onto the node (clone, or scp a tarball)
+# 1. Clone the repository onto the node
 git clone https://github.com/shellylittleant/MeshCDN.git
 cd MeshCDN
 
-# 2. Build + install as the first node
-sudo bash scripts/build-and-install.sh \
+# 2. Build the binary (requires Go 1.21+; install Go first if missing)
+make build                 # produces ./cdn-agent
+
+# 3. Install as the first node
+cp cdn-agent scripts/      # the installer looks for the binary alongside itself
+sudo bash scripts/install.sh \
   --bot-token="<your_telegram_bot_token>" \
-  --group-id="<your_telegram_group_id>" \
-  --source=.
+  --group-id="<your_telegram_group_id>"
 ```
 
 Then, in your Telegram group:
@@ -106,16 +105,20 @@ That's it — `example.com` → `1.2.3.4:443` is now served with auto-renewing S
 > create a group, add the bot, and get the group ID. See
 > [docs/V4-DESIGN.md](docs/V4-DESIGN.md) for details.
 
-### Adding a second node / 加第二个节点
+### Adding a second node
 
-On the new machine, point it at any existing peer:
+On the new machine, build the binary the same way, then run the bootstrap
+script pointed at any existing peer:
 
 ```bash
-sudo bash scripts/build-and-install.sh \
+git clone https://github.com/shellylittleant/MeshCDN.git
+cd MeshCDN
+make build
+cp cdn-agent scripts/
+sudo bash scripts/bootstrap.sh \
   --bot-token="<token>" \
   --group-id="<group_id>" \
-  --peer="<existing-node-ip>" \
-  --source=.
+  --peer="<existing-node-ip>"
 ```
 
 The new node authenticates via a shared secret derived from
@@ -123,7 +126,7 @@ The new node authenticates via a shared secret derived from
 
 ---
 
-## Architecture overview / 架构概览
+## Architecture overview
 
 ```
                  ┌─────────────────┐
@@ -156,22 +159,22 @@ Nodes other than the Bot node never connect to Telegram, so nodes in
 network-restricted regions can fully participate — serve traffic, sync config,
 hold certificates — without external API access.
 
-### Three subsystems / 三套系统
+### Three subsystems
 
 V4 organizes everything by lifecycle:
 
-- **Skeleton (骨架)** — what sits on disk. A `persistent/` directory (identity,
-  peers, certs, config snapshot — survives upgrades) and a `runtime/` directory
-  (SQLite DB, generated nginx config, cache — rebuilt from `persistent/` on each upgrade).
-- **Muscle (肌肉)** — the command system. A strict four-segment grammar
-  (`/<verb> <type> <scope> <params>`), batch transactions, and one handler per type.
-- **Blood (血液)** — the mesh. HTTP+JSON over port 9443 with bearer-token auth.
+- **Skeleton** — what sits on disk. A `persistent/` directory (identity, peers,
+  certs, config snapshot — survives upgrades) and a `runtime/` directory (SQLite
+  DB, generated nginx config, cache — rebuilt from `persistent/` on each upgrade).
+- **Muscle** — the command system. A strict four-segment grammar
+  (`/<verb> <type> <scope> <params>`), batch transactions, one handler per type.
+- **Blood** — the mesh. HTTP+JSON over port 9443 with bearer-token auth.
 
 See [docs/V4-DESIGN.md](docs/V4-DESIGN.md) for the full design rationale.
 
 ---
 
-## The command model / 命令模型
+## The command model
 
 Everything is a four-segment command, usable identically from Telegram, the CLI,
 or peer-to-peer broadcast:
@@ -189,7 +192,8 @@ A few examples:
 /w domain https://example.com 443 https://1.2.3.4:443   # add domain → origin
 /w ssl example.com -                                     # issue Let's Encrypt cert
 /w sslfile example.com -                                 # upload your own cert (+ attach files)
-/w cache example.com *.jpg,*.png 604800                  # cache static assets 7 days
+/w cache img-7d patterns=*.jpg,*.png ttl=604800          # define a cache object
+/w bind example.com cache:img-7d                         # bind the object to a domain
 /v export - -                                            # export full config (as a file)
 /v status - -                                            # node status
 ```
@@ -204,42 +208,42 @@ For the full command reference, see [docs/V4-DESIGN.md](docs/V4-DESIGN.md) §8.
 
 ---
 
-## Status / 项目状态
+## Status
 
 **Alpha — in active production testing.** Run by the author across real VPS
 nodes in multiple regions. Usable for non-critical workloads today.
 
 What's working:
 
-- Equal-peer mesh, peer auth, live broadcast + heartbeat sync ✓
+- Equal-peer mesh, peer auth, live broadcast + heartbeat sync
 - SSL lifecycle: Let's Encrypt (IP + domain), user-uploaded certs (PEM
-  auto-detection, multi-SAN, cert/key pair validation), self-signed fallback ✓
+  auto-detection, multi-SAN, cert/key pair validation), self-signed fallback
 - Command surface: `domain`, `ssl`, `sslfile`, `cache`, `header`, `redirect`,
-  `defense`, plus management (`export`, `sync`, `target`, `upgrade`, `nodes`,
-  `status`, `bind`) ✓
+  `defense`, `bind`, plus management (`export`, `sync`, `target`, `upgrade`,
+  `nodes`, `status`)
 - Multi-provider AI assistant (OpenAI / Gemini / Claude / DeepSeek / Grok / Qwen),
-  read-only/advisory ✓
-- File-based config export/import via Telegram ✓
-- Cluster-wide upgrades; `runtime/` rebuilt from `persistent/` ✓
+  read-only/advisory
+- File-based config export/import via Telegram
+- Cluster-wide upgrades; `runtime/` rebuilt from `persistent/`
 
 Not yet rebuilt from v3.x (planned):
 
-- Rule templates (`#name` references)
+- Rule templates (`#name` references) — superseded by the object/bind model
 - Smart origin routing (ordered failover paths through peers)
 - Bulk origin replacement, node-level redirects
 
 ---
 
-## Documentation / 文档
+## Documentation
 
 | Document | Topic |
 |---|---|
 | [docs/V4-DESIGN.md](docs/V4-DESIGN.md) | The V4 "constitution": architecture, command grammar, schema, design rationale |
-| [docs/AI-PRIMER.md](docs/AI-PRIMER.md) | How the AI assistant works and how to configure providers |
+| [docs/AI-PRIMER.md](docs/AI-PRIMER.md) | Condensed overview of the system — start here if you're an AI tool or a new contributor |
 
 ---
 
-## Building from source / 从源码构建
+## Building from source
 
 ```bash
 # Requires Go 1.21+
@@ -256,7 +260,7 @@ generated at build time and is not committed to the repository.
 
 ---
 
-## License / 许可
+## License
 
 [Apache License 2.0](LICENSE).
 
@@ -265,7 +269,7 @@ keep the copyright notices intact.
 
 ---
 
-## Acknowledgments / 致谢
+## Acknowledgments
 
 - [OpenResty](https://openresty.org/) — nginx + LuaJIT, the proxy engine
 - [Let's Encrypt](https://letsencrypt.org/) — free TLS certificates
