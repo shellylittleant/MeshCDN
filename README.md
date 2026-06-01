@@ -70,20 +70,14 @@ cluster-wide config sync), but where every node is yours.
 
 ## Quick start (single node)
 
-There are no prebuilt release binaries yet — you build from source on the node.
-The repository already contains the full Go source, so the flow is: build the
-binary, then run the installer (which finds the binary you just built).
+The install script handles everything in one shot: installs Go if needed
+(with Chinese-mirror fallbacks), fetches dependencies, builds the binary, then
+installs OpenResty + systemd units. Tested on **Ubuntu 22.04+**.
 
 ```bash
-# 1. Clone the repository onto the node
 git clone https://github.com/shellylittleant/MeshCDN.git
 cd MeshCDN
 
-# 2. Build the binary (requires Go 1.21+; install Go first if missing)
-make build                 # produces ./cdn-agent
-
-# 3. Install as the first node
-cp cdn-agent scripts/      # the installer looks for the binary alongside itself
 sudo bash scripts/install.sh \
   --bot-token="<your_telegram_bot_token>" \
   --group-id="<your_telegram_group_id>"
@@ -93,7 +87,7 @@ Then, in your Telegram group:
 
 ```
 /menu                                                  # main menu
-/w domain https://example.com 443 https://1.2.3.4:443  # register a domain
+/w domain https://example.com:443 https://1.2.3.4:443  # register a domain
 /w ssl example.com -                                   # auto Let's Encrypt
 /v domain example.com -                                # inspect it
 ```
@@ -107,21 +101,20 @@ That's it — `example.com` → `1.2.3.4:443` is now served with auto-renewing S
 
 ### Adding a second node
 
-On the new machine, build the binary the same way, then run the bootstrap
-script pointed at any existing peer:
+On the new machine, point it at any existing peer using the same one-command flow:
 
 ```bash
 git clone https://github.com/shellylittleant/MeshCDN.git
 cd MeshCDN
-make build
-cp cdn-agent scripts/
+
 sudo bash scripts/bootstrap.sh \
   --bot-token="<token>" \
   --group-id="<group_id>" \
   --peer="<existing-node-ip>"
 ```
 
-The new node authenticates via a shared secret derived from
+`bootstrap.sh` chains into `install.sh` internally, so it inherits the same
+auto-build behavior. The new node authenticates via a shared secret derived from
 `sha256(group_id + bot_token)`, pulls the full config, and joins the mesh.
 
 ---
@@ -189,11 +182,11 @@ or peer-to-peer broadcast:
 A few examples:
 
 ```
-/w domain https://example.com 443 https://1.2.3.4:443   # add domain → origin
+/w domain https://example.com:443 https://1.2.3.4:443   # add domain → origin
 /w ssl example.com -                                     # issue Let's Encrypt cert
 /w sslfile example.com -                                 # upload your own cert (+ attach files)
 /w cache img-7d patterns=*.jpg,*.png ttl=604800          # define a cache object
-/w bind example.com cache:img-7d                         # bind the object to a domain
+/w bind https://example.com:443 cache:img-7d             # bind the object to a domain
 /v export - -                                            # export full config (as a file)
 /v status - -                                            # node status
 ```
@@ -201,7 +194,7 @@ A few examples:
 Run the same commands from any node's CLI:
 
 ```bash
-sudo cdn-agent exec "/w domain https://example.com 443 https://1.2.3.4:443"
+sudo cdn-agent exec "/w domain https://example.com:443 https://1.2.3.4:443"
 ```
 
 For the full command reference, see [docs/V4-DESIGN.md](docs/V4-DESIGN.md) §8.
@@ -243,7 +236,10 @@ Not yet rebuilt from v3.x (planned):
 
 ---
 
-## Building from source
+## Building from source manually
+
+`scripts/install.sh` builds automatically when no pre-built binary is present,
+so end-users normally never run these commands. They're here for developers:
 
 ```bash
 # Requires Go 1.21+
