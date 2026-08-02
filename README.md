@@ -8,8 +8,10 @@ provider, without a central control plane, and without exposing any management
 interface to the public internet.
 
 > **Version note**
-> Current release: **v4.3.1**. Anyone running a cluster of more than a few
-> nodes should take this one — see the config-generation fix below.
+> Current release: **v4.3.2**. Anyone running a cluster of more than a few
+> nodes should take this one — see the config-generation and membership fixes
+> below.
+>
 > This is **MeshCDN v4**, a complete ground-up rewrite in Go. Earlier v2.x/v3.x
 > lines were a different codebase; their documentation is preserved under the
 > release [`v3.1.0`](../../releases/tag/v3.1.0) for historical reference. v4
@@ -220,6 +222,19 @@ What's working:
   read-only/advisory
 - File-based config export/import via Telegram
 - Cluster-wide upgrades; `runtime/` rebuilt from `persistent/`
+
+New in v4.3.2:
+
+- **Removing a node now actually removes it, everywhere.** A snapshot states
+  the whole peer set, but replaying one could only ever *add*
+  (`/w internal peer-add`) — so `/w internal peer-remove` took effect only on
+  the node that ran it. Every other node kept the stale entry, and the next
+  time the node that ran the removal pulled a snapshot from one of them, the
+  entry came back. The removal appeared to succeed and silently undid itself.
+  Snapshot import now reconciles membership — both `peers.json` and the `peers`
+  mirror table — against what the snapshot declares. A snapshot that declares
+  no peers is treated as saying nothing about membership rather than as "the
+  cluster is empty", and a node never removes itself from its own peer list.
 
 New in v4.3.1:
 

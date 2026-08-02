@@ -10,13 +10,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/example/meshcdn/internal/cert"
 	"github.com/example/meshcdn/internal/db"
 	"github.com/example/meshcdn/internal/nginx"
+	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
 )
 
@@ -39,6 +42,11 @@ type Executor struct {
 	// CacheDir is the proxy_cache directory emptied by a purge action.
 	// Empty → DefaultCacheDir.
 	CacheDir string
+
+	// PeerMgr owns persistent/peers.json. Set on nodes that participate in a
+	// mesh; nil in single-node CLI mode, where membership reconciliation is
+	// skipped.
+	PeerMgr *peers.Manager
 
 	// BroadcastExec sends a command to every peer (each runs it locally) and
 	// returns a short human report. Wired only on nodes with a live mesh
@@ -308,6 +316,133 @@ func purgeCacheDir(dir string) (int, error) {
 //
 // Step 6: snapshot replay automatically runs in force mode (we don't want
 // peer-replay to trigger /v confirm prompts mid-import).
+// reconcilePeers converges local cluster membership — both persistent/peers.json
+// and the `peers` mirror table — on what a snapshot declares.
+//
+// A snapshot states the whole peer set, but replaying it can only ever add
+// (`/w internal peer-add`). Without this step a peer removed on one node is
+// removed nowhere else: the shorter snapshot replays as a no-op everywhere, and
+// the next time the node that ran the removal pulls from a node that still
+// carries the stale entry, the entry comes back. Removal appeared to work and
+// silently undid itself.
+//
+// Two guards, both load-bearing:
+//
+//   - declared == nil means the snapshot said nothing about membership. Do
+//     nothing; an empty peer list would isolate the node permanently.
+//   - this node is always kept, at its existing join order. Pulling a snapshot
+//     that predates our own join would otherwise delete us from our own peer
+//     list, and a node that does not know itself cannot be reasoned about by
+//     the bot-node predicate or by `/v nodes`.
+//
+// Deletions are surgical rather than delete-all-then-rebuild, so a partial
+// failure can never leave the node with no peers.
+func (e *Executor) reconcilePeers(ctx context.Context, declared map[string]int) error {
+	if declared == nil {
+		return nil
+	}
+
+	keep := make(map[string]bool, len(declared)+1)
+	for ip := range declared {
+		keep[ip] = true
+	}
+	if e.NodeIP != "" {
+		keep[e.NodeIP] = true
+	}
+
+	// Mirror table first: it is derived state, so a failure here is worth
+	// reporting but must not stop peers.json (the durable copy) converging.
+	dbErr := e.pruneDBPeers(ctx, keep)
+
+	if err := e.reconcilePeersFile(declared); err != nil {
+		return err
+	}
+	return dbErr
+}
+
+// pruneDBPeers deletes rows from the peers mirror table whose IP is not kept.
+func (e *Executor) pruneDBPeers(ctx context.Context, keep map[string]bool) error {
+	rows, err := e.DB.QueryContext(ctx, `SELECT ip FROM peers`)
+	if err != nil {
+		return fmt.Errorf("read peer rows: %w", err)
+	}
+	var drop []string
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			rows.Close()
+			return err
+		}
+		if !keep[ip] {
+			drop = append(drop, ip)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, ip := range drop {
+		if _, err := e.DB.ExecContext(ctx, `DELETE FROM peers WHERE ip = ?`, ip); err != nil {
+			return fmt.Errorf("delete peer row %s: %w", ip, err)
+		}
+	}
+	return nil
+}
+
+func (e *Executor) reconcilePeersFile(declared map[string]int) error {
+	if e.PeerMgr == nil || declared == nil {
+		return nil
+	}
+
+	existing, err := e.PeerMgr.All()
+	if err != nil {
+		return fmt.Errorf("read current peers: %w", err)
+	}
+
+	selfOrder := -1
+	for _, p := range existing {
+		if p.IP == e.NodeIP {
+			selfOrder = p.JoinOrder
+			break
+		}
+	}
+
+	next := make([]peers.Peer, 0, len(declared)+1)
+	for ip, order := range declared {
+		next = append(next, peers.Peer{IP: ip, JoinOrder: order})
+	}
+	if _, ok := declared[e.NodeIP]; !ok && e.NodeIP != "" && selfOrder >= 0 {
+		next = append(next, peers.Peer{IP: e.NodeIP, JoinOrder: selfOrder})
+	}
+
+	sort.Slice(next, func(i, j int) bool {
+		if next[i].JoinOrder != next[j].JoinOrder {
+			return next[i].JoinOrder < next[j].JoinOrder
+		}
+		return next[i].IP < next[j].IP
+	})
+
+	if len(next) == len(existing) {
+		same := true
+		for i := range next {
+			if next[i] != existing[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return nil // nothing changed; don't rewrite the file
+		}
+	}
+
+	if err := e.PeerMgr.ReplaceAll(next); err != nil {
+		return err
+	}
+	log.Printf("[snapshot] peer list reconciled: %d → %d", len(existing), len(next))
+	return nil
+}
+
 func (e *Executor) ApplySnapshot(ctx context.Context, snapshotText string) (*snapshot.ReplayResult, error) {
 	snap, err := snapshot.ParseText(snapshotText)
 	if err != nil {
@@ -319,6 +454,15 @@ func (e *Executor) ApplySnapshot(ctx context.Context, snapshotText string) (*sna
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Converge membership on what the snapshot declares. Replay can only add,
+	// so without this a removed peer is removed only on the node that ran the
+	// command — and comes back the next time that node pulls from a stale one.
+	if err := e.reconcilePeers(ctx, snap.DeclaredPeers()); err != nil {
+		// Membership drift is worth reporting but must not abort a config
+		// sync that has already committed.
+		log.Printf("[snapshot] reconcile peers.json: %v", err)
 	}
 
 	if e.CertStore != nil {

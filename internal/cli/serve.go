@@ -324,6 +324,10 @@ func Serve(args []string) error {
 	// each peer clearing its own cache. meshClient is captured by closure since
 	// startMesh assigns it later.
 	executor.CacheDir = pathOverride("MESHCDN_CACHE_DIR", command.DefaultCacheDir)
+	// Lets snapshot replay reconcile persistent/peers.json, so a peer removed
+	// anywhere is removed everywhere rather than only on the node that ran the
+	// command.
+	executor.PeerMgr = peerMgr
 	executor.BroadcastExec = func(ctx context.Context, cmdText string) string {
 		if meshClient == nil {
 			return "  (mesh 未就绪，未广播到 peer)"

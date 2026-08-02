@@ -249,6 +249,35 @@ func (e *Exporter) exportBindings(ctx context.Context, snap *Snapshot) error {
 	return rows.Err()
 }
 
+// DeclaredPeers returns the cluster membership this snapshot asserts, as
+// ip → join_order, parsed from its `/w internal peer-add` lines.
+//
+// A snapshot states the whole peer set, not a diff: a node missing from it has
+// been removed. Callers use this to reconcile local membership, because
+// replaying the commands alone can only ever add. Returns nil when the
+// snapshot declares no peers at all — that is a snapshot which says nothing
+// about membership (an old export, or a stripped-down test fixture), and
+// treating it as "the cluster is now empty" would be catastrophic.
+func (s *Snapshot) DeclaredPeers() map[string]int {
+	out := map[string]int{}
+	for _, line := range s.Commands {
+		f := strings.Fields(line)
+		// /w internal peer-add <ip> <join_order>
+		if len(f) < 5 || f[0] != "/w" || f[1] != "internal" || f[2] != "peer-add" {
+			continue
+		}
+		order, err := strconv.Atoi(f[4])
+		if err != nil {
+			continue
+		}
+		out[f[3]] = order
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (s *Snapshot) Save() error { return s.SaveTo(Path()) }
 
 func (s *Snapshot) SaveTo(path string) error {

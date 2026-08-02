@@ -62,6 +62,14 @@ func (s *Snapshot) Import(ctx context.Context, db *sql.DB,
 		`DELETE FROM rule_objects`,
 		`DELETE FROM bindings`,
 	}
+
+	// Deliberately NOT wiping `peers` here. Membership does need to converge on
+	// what the snapshot declares — replay alone can only add — but a blanket
+	// DELETE is the wrong tool: replay failures are counted and skipped rather
+	// than aborting, so one bad peer-add line would leave the node with no peer
+	// rows at all and commit that. Membership is reconciled surgically after
+	// the transaction instead (Executor.reconcilePeers): drop exactly the rows
+	// the snapshot omits, touch nothing else.
 	for _, stmt := range wipeStatements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			_ = tx.Rollback()
