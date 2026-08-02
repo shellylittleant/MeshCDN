@@ -181,6 +181,22 @@ type Effects struct {
 	// /confirm flow.
 	PortProtocolBindings []PortProtocolBinding
 
+	// ForceVersionBump makes the executor treat the batch as a config mutation
+	// (bump config_version, export snapshot, notify peers) even when no /w or /d
+	// ran. Used by read-shaped actions that nonetheless change synced cluster
+	// state — e.g. /v target writing cluster_meta.bot_node_ip.
+	ForceVersionBump bool
+
+	// PurgeCache asks the executor to empty this node's proxy_cache directory
+	// and reload nginx. It is an action effect (like /v sync): it carries no DB
+	// mutation, so it does NOT bump config_version or enter the snapshot stream.
+	PurgeCache bool
+
+	// PurgeCacheBroadcast, when set alongside PurgeCache, tells the executor to
+	// fan the purge out to every peer (each clears its own cache). Peers receive
+	// the non-broadcasting form, so there is no re-broadcast storm.
+	PurgeCacheBroadcast bool
+
 	// UserMessage is the friendly response shown to the user (Telegram or CLI).
 	// Should be 1-2 sentences for normal cases; may include emoji.
 	UserMessage string
@@ -418,6 +434,15 @@ const (
 func (e *Effects) Merge(other Effects) {
 	if other.NeedsNginxReload {
 		e.NeedsNginxReload = true
+	}
+	if other.ForceVersionBump {
+		e.ForceVersionBump = true
+	}
+	if other.PurgeCache {
+		e.PurgeCache = true
+	}
+	if other.PurgeCacheBroadcast {
+		e.PurgeCacheBroadcast = true
 	}
 	e.NeedsCertReselect = append(e.NeedsCertReselect, other.NeedsCertReselect...)
 	e.EventNotifications = append(e.EventNotifications, other.EventNotifications...)

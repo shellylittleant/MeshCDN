@@ -132,6 +132,11 @@ func (e *Exporter) Export(ctx context.Context) (*Snapshot, error) {
 	if err := e.exportPeers(ctx, snap); err != nil {
 		return nil, err
 	}
+	// 1b) Bot-node override (if any) — so the transferred bot role converges
+	// across the cluster and survives upgrades.
+	if err := e.exportBotNode(ctx, snap); err != nil {
+		return nil, err
+	}
 	// 2) Domains
 	if err := e.exportDomains(ctx, snap); err != nil {
 		return nil, err
@@ -166,6 +171,20 @@ func (e *Exporter) exportPeers(ctx context.Context, snap *Snapshot) error {
 			fmt.Sprintf("/w internal peer-add %s %d", ip, jo))
 	}
 	return rows.Err()
+}
+
+func (e *Exporter) exportBotNode(ctx context.Context, snap *Snapshot) error {
+	var ip sql.NullString
+	err := e.DB.QueryRowContext(ctx,
+		`SELECT bot_node_ip FROM cluster_meta WHERE id = 1`).Scan(&ip)
+	if err != nil {
+		return nil // cluster_meta always exists; tolerate stripped test envs
+	}
+	if ip.Valid && ip.String != "" {
+		snap.Commands = append(snap.Commands,
+			fmt.Sprintf("/w internal set-bot %s", ip.String))
+	}
+	return nil
 }
 
 func (e *Exporter) exportDomains(ctx context.Context, snap *Snapshot) error {

@@ -31,6 +31,13 @@ http {
     access_log  /etc/meshcdn/runtime/logs/access.log main;
     error_log   /etc/meshcdn/runtime/logs/error.log warn;
 
+    # Structured stats log consumed by the logs collector (/v stats). One JSON
+    # object per request; the collector tails this file and aggregates per
+    # (domain, minute, status). Keep the field names in sync with logs.logLine.
+    log_format meshcdn_stats escape=json
+        '{"t":"$time_iso8601","host":"$host","status":$status,"bytes":$body_bytes_sent}';
+    access_log  /etc/meshcdn/runtime/logs/stats.log meshcdn_stats;
+
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -94,6 +101,30 @@ server {
 {{- end }}
 {{- range .Policy.Defenses.AllowIPs }}
     allow {{ . }};
+{{- end }}
+
+{{- /* Defense: User-Agent regex blocking (OpenResty Lua). All patterns from
+       every bound defense object are merged into ONE access_by_lua_block for
+       this server (per-request cost is one loop, not one block per rule). The
+       access phase runs after nginx's allow/deny above, preserving "block 优先":
+       an IP already denied never reaches this check. Patterns are embedded as
+       Lua string literals via luaQuote and matched with ngx.re.match "jo"
+       (PCRE JIT + compile-once cache). Validation (validateUARegex) already
+       rejected control chars / ReDoS shapes before this point. */ -}}
+{{- if .Policy.Defenses.BlockUA }}
+    access_by_lua_block {
+        local ua = ngx.var.http_user_agent or ""
+        local patterns = {
+{{- range .Policy.Defenses.BlockUA }}
+            {{ luaQuote . }},
+{{- end }}
+        }
+        for _, pat in ipairs(patterns) do
+            if ngx.re.match(ua, pat, "jo") then
+                return ngx.exit(403)
+            end
+        end
+    }
 {{- end }}
 
 {{- /* Defense: rate limit + body size */ -}}

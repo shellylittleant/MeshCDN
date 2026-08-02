@@ -34,12 +34,30 @@ const (
 // Task is a unit of work in the renewal queue.
 type Task struct {
 	Type        TaskType
-	Fingerprint string      // current cert's fingerprint prefix
-	Identifier  string      // domain or IP for which cert is needed
-	Source      cert.Source // current cert's source (LE/upload/self)
+	Fingerprint string // current cert's fingerprint prefix
+
+	// Identifier is the primary name (CN, or first SAN when CN is empty as on
+	// IP certs). Used for logging, alerts, and replacement-coverage checks.
+	Identifier string
+
+	// Identifiers is the full SAN set to re-issue. Renewal must not shrink a
+	// multi-domain cert to its CN (V4-DESIGN §3.7). Empty → renewIDs() falls
+	// back to []string{Identifier}.
+	Identifiers []string
+
+	Source cert.Source // current cert's source (LE/upload/self)
 
 	// Carried forward across step transitions
 	LastError error
+}
+
+// renewIDs returns the identifier set to re-issue, defaulting to the primary
+// identifier when the full SAN set wasn't supplied.
+func (t Task) renewIDs() []string {
+	if len(t.Identifiers) > 0 {
+		return t.Identifiers
+	}
+	return []string{t.Identifier}
 }
 
 // AlertSink receives admin-facing alerts (V4-DESIGN §3.7 step 3).
@@ -157,10 +175,10 @@ func (w *Worker) stepRenew(ctx context.Context, task Task) {
 				Identifier: task.Identifier, Source: task.Source, LastError: task.LastError})
 			return
 		}
-		certPEM, keyPEM, err := w.ACMEClient.Issue(ctx, task.Identifier)
+		certPEM, keyPEM, err := w.ACMEClient.IssueMulti(ctx, task.renewIDs())
 		if err != nil {
 			task.LastError = err
-			log.Printf("[renew/worker] LE renewal failed for %s: %v", task.Identifier, err)
+			log.Printf("[renew/worker] LE renewal failed for %v: %v", task.renewIDs(), err)
 			w.Enqueue(Task{Type: TaskFindReplacement, Fingerprint: task.Fingerprint,
 				Identifier: task.Identifier, Source: task.Source, LastError: err})
 			return
@@ -174,11 +192,11 @@ func (w *Worker) stepRenew(ctx context.Context, task Task) {
 		return
 
 	case cert.SourceSelf:
-		// Regenerate self-signed (cheap)
-		certPEM, keyPEM, err := cert.GenerateSelfSigned(task.Identifier)
+		// Regenerate self-signed (cheap), preserving the full SAN set
+		certPEM, keyPEM, err := cert.GenerateSelfSignedMulti(task.renewIDs())
 		if err != nil {
 			task.LastError = err
-			log.Printf("[renew/worker] self-sign regenerate failed for %s: %v", task.Identifier, err)
+			log.Printf("[renew/worker] self-sign regenerate failed for %v: %v", task.renewIDs(), err)
 			w.Enqueue(Task{Type: TaskFindReplacement, Fingerprint: task.Fingerprint,
 				Identifier: task.Identifier, Source: task.Source, LastError: err})
 			return

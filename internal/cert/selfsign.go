@@ -34,6 +34,18 @@ import (
 // Returns PEM-encoded certificate and private key bytes, ready to feed
 // into Store.Add(certPEM, keyPEM, SourceSelf).
 func GenerateSelfSigned(identifier string) (certPEM, keyPEM []byte, err error) {
+	return GenerateSelfSignedMulti([]string{identifier})
+}
+
+// GenerateSelfSignedMulti is like GenerateSelfSigned but covers every identifier
+// (any mix of DNS names and IPs) in the SAN. Renewal uses this so re-generating
+// a self-signed cert preserves its full SAN set instead of shrinking to the CN
+// (V4-DESIGN §3.7). The CommonName is the first identifier.
+func GenerateSelfSignedMulti(identifiers []string) (certPEM, keyPEM []byte, err error) {
+	if len(identifiers) == 0 {
+		return nil, nil, fmt.Errorf("no identifiers for self-signed cert")
+	}
+
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
@@ -44,20 +56,22 @@ func GenerateSelfSigned(identifier string) (certPEM, keyPEM []byte, err error) {
 		return nil, nil, fmt.Errorf("generate serial: %w", err)
 	}
 
-	// Determine if the identifier is an IP or a hostname
+	// Split identifiers into IPs and hostnames for the SAN.
 	var ipSAN []net.IP
 	var dnsSAN []string
-	if ip := net.ParseIP(identifier); ip != nil {
-		ipSAN = []net.IP{ip}
-	} else {
-		dnsSAN = []string{identifier}
+	for _, id := range identifiers {
+		if ip := net.ParseIP(id); ip != nil {
+			ipSAN = append(ipSAN, ip)
+		} else {
+			dnsSAN = append(dnsSAN, id)
+		}
 	}
 
 	now := time.Now().UTC()
 	template := x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   identifier,
+			CommonName:   identifiers[0],
 			Organization: []string{"MeshCDN Self-Signed"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour), // small leeway for clock skew

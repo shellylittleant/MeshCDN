@@ -23,6 +23,8 @@ import (
 	"strings"
 
 	"github.com/example/meshcdn/internal/command"
+	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/peers"
 )
 
 // SystemHandler is dispatched on system verbs; the verb itself goes into
@@ -69,8 +71,11 @@ func (h *SyncHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, e
 // ─────────────────────────────────────────────────────────────────────
 
 type TargetHandler struct {
-	// In step 5, this is a stub. Real bot-role transfer happens in step 7
-	// where Telegram bot is integrated.
+	// PeerMgr validates the target IP is a known cluster peer and provides the
+	// join-order default bot node. Wired by serve.go / exec.go.
+	PeerMgr *peers.Manager
+	// LocalNodeIP is this node's IP, for friendlier messaging.
+	LocalNodeIP string
 }
 
 func (h *TargetHandler) Type() string { return "target" }
@@ -96,11 +101,56 @@ func (h *TargetHandler) Write(tx *sql.Tx, cmd *command.Command) (command.Effects
 func (h *TargetHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
 	return command.Effects{}, command.NewError(command.ErrBadFormat, "use /v target")
 }
+
+// View transfers the bot role to the given peer. It persists an explicit
+// bot-node override in cluster_meta.bot_node_ip and forces a version bump so the
+// change rides the config-version stream to every node (snapshot replay applies
+// `/w internal set-bot <ip>`). Per the state-layer scope, the target actually
+// begins polling Telegram — and the origin stops — on its next agent restart;
+// the boot gate reads this override. Live (no-restart) switching is a separate
+// follow-up.
 func (h *TargetHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
-	// Step 5 stub — real implementation lands in step 7 (Telegram bot)
+	ctx := context.Background()
+	target := cmd.Scope
+
+	// Target must be a known cluster peer.
+	if h.PeerMgr != nil {
+		all, err := h.PeerMgr.All()
+		if err != nil {
+			return command.Effects{}, fmt.Errorf("load peers: %w", err)
+		}
+		known := false
+		for _, p := range all {
+			if p.IP == target {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return command.Effects{}, command.NewError(command.ErrNotFound,
+				fmt.Sprintf("target %s 不是已知集群节点 (先 /v nodes - - 查看，或让它先认亲)", target))
+		}
+	}
+
+	current, _ := db.GetBotNodeIP(ctx, tx)
+	if current == "" && h.PeerMgr != nil {
+		current = h.PeerMgr.BotNodeIP() // join-order default
+	}
+	if current == target {
+		return command.Effects{
+			UserMessage: fmt.Sprintf("%s 已经是当前 bot 节点，无需转移", target),
+		}, nil
+	}
+
+	if err := db.SetBotNodeIP(ctx, tx, target); err != nil {
+		return command.Effects{}, err
+	}
+
 	return command.Effects{
-		UserMessage: fmt.Sprintf("target %s: bot 角色转移功能将在 step 7 (Telegram bot) 实现",
-			cmd.Scope),
+		ForceVersionBump: true,
+		UserMessage: fmt.Sprintf(
+			"✅ bot 角色已转移至 %s (全集群同步)。\n⚠️ 目标节点需在下次 agent 重启后才开始接管 Telegram 轮询；原 bot 节点重启后停止轮询。",
+			target),
 	}, nil
 }
 
@@ -109,9 +159,9 @@ func (h *TargetHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 // ─────────────────────────────────────────────────────────────────────
 
 type UpgradeHandler struct {
-	// Stub in step 5; full impl is below the line in this file as a
-	// "trigger" function called from cli/upgrade.go in step 5.
-	OnUpgrade func(ctx context.Context) error
+	// OnUpgrade triggers the cluster upgrade and returns a per-node report
+	// (which nodes confirmed the new version, which failed). Wired by serve.go.
+	OnUpgrade func(ctx context.Context) (string, error)
 }
 
 func (h *UpgradeHandler) Type() string { return "upgrade" }
@@ -136,12 +186,16 @@ func (h *UpgradeHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects
 			UserMessage: "upgrade not wired (binary distribution not yet available)",
 		}, nil
 	}
-	if err := h.OnUpgrade(context.Background()); err != nil {
+	// OnUpgrade returns a per-node report even on partial failure — surfacing
+	// which nodes upgraded is the whole point, so we show the report either way.
+	report, err := h.OnUpgrade(context.Background())
+	if report == "" && err != nil {
 		return command.Effects{}, fmt.Errorf("upgrade: %w", err)
 	}
-	return command.Effects{
-		UserMessage: "已触发集群滚动升级",
-	}, nil
+	if report == "" {
+		report = "已触发集群升级"
+	}
+	return command.Effects{UserMessage: report}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -182,6 +236,8 @@ A 类 - 直接命令
 
 B 类 - 对象命令 (step 6)
   /w cache    <名字>            <key=value...>      定义缓存对象
+  /v cache    -                 purge-all           清空全集群缓存并 reload
+  /v cache    -                 purge-node          仅清空本节点缓存
   /w defense  <名字>            <key=value...>      定义防御对象
   /w redirect <名字>            <key=value...>      定义重定向对象
   /w header   <名字>            <key=value...>      定义头部对象
@@ -194,11 +250,11 @@ V 类 - 查询命令
   /v export   -                 -                    导出全集群配置
   /v status   -                 -                    本节点状态
   /v nodes    [<peer-ip>|-]     -                    peer 列表/详情
-  /v stats    -                 -                    流量统计
+  /v stats    [<域名>|-]        [<窗口>|-]           流量统计 (本节点; 窗口如 24h/7d, 默认 24h)
 
 系统动作 (read-shaped, 用 /v 调用)
   /v sync     -                 -                    强制同步给所有 peer
-  /v target   <peer-ip>         -                    转移 bot 角色 (step 7)
+  /v target   <peer-ip>         -                    转移 bot 角色 (重启后生效)
   /v upgrade  -                 -                    触发集群升级
   /v help     -                 -                    本帮助
   /v menu     -                 -                    主菜单 (Telegram 用)

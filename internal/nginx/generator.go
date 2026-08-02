@@ -272,9 +272,36 @@ func (g *Generator) renderMain(_ *generatorState) error {
 	})
 }
 
+// luaQuote renders s as a safe Lua double-quoted string literal for embedding
+// in an access_by_lua_block. User-Agent regex patterns reach here as data, never
+// code; combined with validateUARegex (which already rejected control chars),
+// escaping backslash/quote/CR/LF makes Lua-string injection impossible.
+func luaQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
 // renderServer now takes a DomainPolicy.
 func (g *Generator) renderServer(s serverEntry, st *generatorState, policy *DomainPolicy) error {
-	t, err := template.New("server").Parse(serverConfTemplate)
+	t, err := template.New("server").Funcs(template.FuncMap{
+		"luaQuote": luaQuote,
+	}).Parse(serverConfTemplate)
 	if err != nil {
 		return err
 	}

@@ -1,228 +1,190 @@
-# MeshCDN V4 — AI Primer
+# MeshCDN V4 — AI 读本
 
 **Read this first. Everything else is implementation detail.**
 
-> Once you've read this file, an AI tool has enough context to work on the
-> project. Read this at the start of every session by default. The real design
-> document is `V4-DESIGN.md`; this file is a condensed extract.
->
-> (Documentation is in English, but you can interact in any language — an LLM
-> assistant replies in whatever language you write in.)
+> 读完这份文件，AI 工具就能进入项目状态。每次会话开始默认读这一份。
+> 真正的设计文档是 `V4-DESIGN.md`，本文件是它的精简提取。
 
 ---
 
-## What the project is
+## 项目是什么
 
-MeshCDN is a **self-hosted distributed CDN**. Multiple VPS nodes form a cluster
-via a mesh protocol, controlled by a Telegram bot. Each node runs OpenResty +
-cdn-agent. A single Go binary, roughly 5 MB.
+MeshCDN 是一个**自建分布式 CDN**。多台 VPS 节点通过 mesh 协议组成集群，由 Telegram bot 控制。每个节点跑 OpenResty + cdn-agent。Go 单二进制，约 5MB。
 
 ---
 
-## Six design principles (every decision traces back here)
+## 六条设计哲学（任何决策都要回到这里）
 
-1. **Equal peers** — All nodes hold identical configuration. The "master" is
-   merely whichever node currently talks to the bot.
-2. **Commands are configuration** — Configuration is a sequence of commands.
-   Exporting is templating; replaying is recovery.
-3. **Precision is priority** — All match-type rules are ordered automatically by
-   precision; no manual weights.
-4. **Heartbeat sync** — Nodes probe each other, cross-check, and converge
-   automatically.
-5. **Transactional consistency** — A batch is the atomic unit. The version
-   counter only commits to successful commands; failed commands do not exist at
-   the protocol level.
-6. **The program's boundary = the information boundary** — The program informs;
-   the human decides. Alerting is an obligation; fallback is not. The only
-   exceptions are the bare minimum needed to keep the system bootable and
-   reachable.
+1. **节点平权** — 所有节点配置一致。"主节点"只是当前对接 bot 的那个。
+2. **命令即配置** — 配置就是命令序列。导出即模板，重放即恢复。
+3. **精度即优先级** — 所有匹配类规则按精度自动排序，无需手工指定权重。
+4. **心跳同步** — 节点相互探测、相互核对、配置自动收敛。
+5. **事务一致性** — 批处理是原子单位，版本号只承诺成功命令，失败命令从协议层不存在。
+6. **程序的边界 = 信息边界** — 程序负责告知，人负责决定。告警是义务，兜底不是义务。例外仅限"维持系统可启动 / 可通信"。
 
 ---
 
-## Three subsystems (architectural skeleton)
+## 三套系统（架构骨架）
 
 ```
-Skeleton  →  /etc/meshcdn/persistent/  +  /etc/meshcdn/runtime/
-             Two-directory scheme. On upgrade, runtime/ is wiped,
-             persistent/ is kept.
+骨架 Skeleton  →  /etc/meshcdn/persistent/  +  /etc/meshcdn/runtime/
+                  双目录方案。升级时 runtime/ 全删，persistent/ 保留。
 
-Muscle    →  internal/command/
-             Strict four-segment commands. All external input passes here.
+肌肉 Muscle    →  internal/command/
+                  严格四段式命令。所有外部输入都经此处。
 
-Blood     →  internal/mesh/  +  internal/cert/renew/
-             Background loops: heartbeat / certificate scan / event stream.
+血液 Blood     →  internal/mesh/  +  internal/cert/renew/
+                  三个后台循环：心跳 / 证书扫描 / 事件流。
 ```
 
 ---
 
-## Command system (memorize this)
+## 命令系统（必背）
 
-### Strict four-segment form
+### 严格四段式
 
 ```
 /<verb> <type> <scope> <params>
 ```
 
-Every segment must be present. Use `-` as a placeholder for an empty slot. No
-exceptions.
+每段必须存在。空位用 `-` 占位。无例外。
 
-- **verb**: `w` (write) / `d` (delete) / `v` (view)
-- **type**: `domain` / `ssl` / `sslfile` / `cache` / `defense` / `redirect` /
-  `header` / `bind` / cluster metadata / ...
-- **scope**: depends on the type (domain / IP / object name / `-`)
-- **params**: a `key=value` sequence, or `-`
+- **verb**: `w`(写) / `d`(删) / `v`(查)
+- **type**: `domain` / `ssl` / `sslfile` / `cache` / `defense` / `redirect` / `header` / `bind` / 集群元数据 / ...
+- **scope**: 取决于 type（域名 / IP / 对象名 / `-`）
+- **params**: key=value 序列 或 `-`
 
-### w/d mirror symmetry
+### w/d 镜像对称
 
 ```
-write:  /w cache img-7d patterns=*.jpg ttl=604800
-delete: /d cache img-7d patterns=*.jpg ttl=604800   ← same text, prefix only differs
+写：/w cache img-7d patterns=*.jpg ttl=604800
+删：/d cache img-7d patterns=*.jpg ttl=604800   ← 同文本，只换前缀
 ```
 
-Export = dump in-memory state as a sequence of `w` commands. Delete = change the
-corresponding `w` to `d`.
+导出 = 把内存状态 dump 为 w 命令序列。删除 = 把对应 w 改 d。
 
-### Command classes A / B / C
+### A/B/C 三类命令
 
-**Class A (direct commands, scope = a real business object)**
+**A 类（直接命令，scope = 真实业务对象）**
 ```
-/w domain   <host:port>    <origin>            register a domain
-/w ssl      <domain/IP>    <action or ->       request a certificate
-/w sslfile  <domain/IP>    <option or ->       upload a certificate
-```
-
-**Class B (object commands, scope = object name, no extent)**
-```
-/w cache    <object-name>  <key=value, one line>   define a cache object
-/w defense  <object-name>  <key=value, one line>   define a defense object
-/w redirect <object-name>  <key=value, one line>   define a redirect object
-/w header   <object-name>  <key=value, one line>   define a header object
+/w domain   <host:port>     <origin>             写入域名
+/w ssl      <域名/IP>       <动作或 ->          申请证书
+/w sslfile  <域名/IP>       <选项或 ->          上传证书
 ```
 
-**Class C (binding commands)**
+**B 类（对象命令，scope = 对象名，无作用域）**
 ```
-/w bind     <domain/IP>    <object-type>:<object-name>
-```
-
-### Cluster metadata queries (view only)
-```
-/v export   -              -                    export the whole cluster config
-/v status   -              -                    this node's status
-/v stats    -              -                    traffic statistics
-/v nodes    [- | <peer-ip>] -                   peer list / detail
+/w cache    <对象名>        <key=value 单行>     定义缓存对象
+/w defense  <对象名>        <key=value 单行>     定义防御对象
+/w redirect <对象名>        <key=value 单行>     定义重定向对象
+/w header   <对象名>        <key=value 单行>     定义头部对象
 ```
 
-### System actions (standalone verbs, not part of w/d/v)
+**C 类（绑定命令）**
 ```
-/sync                                            trigger a sync proactively
-/target  <peer-ip>                               move the bot role
-/upgrade                                         trigger a cluster upgrade
-/menu /help                                      menu / help
-/confirm <ID>                                    second-step confirmation
+/w bind     <域名/IP>       <对象类型>:<对象名>
 ```
 
-### The `-` placeholder
+> **B 类对象的 key 是封闭集合**：未知 key 会**直接报错**（不再静默丢弃）。
+> - `defense` 支持：`ip / ua / ref / action / duration / rate / size`。`ua=` 是 User-Agent 正则（OpenResty Lua 拦截，命中返回 403；病态/ReDoS 正则会被拒绝）。
+>   - **UA 正则须兼容 RE2 语法子集**：校验用 Go 的 RE2 引擎（运行时用 PCRE）。因此**反向引用 `\1`、环视 `(?=...)`、原子组 `(?>...)`** 等 PCRE-only 构造会被拒绝——这是有意的（RE2 无回溯，顺带挡掉 PCRE 灾难性回溯）。绝大多数 UA 匹配（`BadBot.*`、`(?i)curl`、`(bot|spider)`）都在子集内。若报"error parsing regexp"，把正则改成不含反向引用/环视的等价写法即可。
+> - `size=`（client_max_body_size，如 `10m`/`1g`）：同域名多绑定时取**更小值**（更严格），单位 k/m/g 或裸字节。
+> - `geo=`（地理封禁）、`cc=`（CC 防护）**尚未实现**，用了会报错——不要向用户建议这两个参数。
+> - `cache`：`patterns / ttl / browser_ttl / hsts`；`redirect`：`from / to / status / regex`；`header`：`request_add / request_del / response_add / response_del`。
 
-`-` uniformly means "fallback / default / no constraint" in every field:
+### 集群元数据查询（仅 v）
+```
+/v export   -               -                    导出全集群配置
+/v status   -               -                    本节点状态
+/v stats    [<域名>|-]      [<窗口>|-]           流量统计 (本节点; 窗口 24h/7d 等, 默认 24h)
+/v nodes    [- | <peer-ip>] -                    peer 列表/详情
+```
 
-- domain field `-` = any host (lowest priority)
-- origin field `-` = this node serves itself (default page)
-- view command scope `-` = list everything
-- view command params `-` = no detail filter
+### 系统动作（独立动词，不入 w/d/v）
+```
+/sync                                              主动触发同步
+/target  <peer-ip>                                 转移 bot 角色
+/upgrade                                           触发集群升级
+/menu /help                                        菜单 / 帮助
+/confirm <ID>                                      二次确认
+```
+
+### 占位符 `-`
+
+`-` 在所有字段统一为"兜底/默认/无限定"。具体含义：
+
+- 域名字段 `-` = 任何 host（最低优先级）
+- 源站字段 `-` = 本节点自己当源（默认页）
+- v 命令的 scope `-` = 列出全部
+- v 命令的 params `-` = 无细节限定
 
 ---
 
-## Key design points
+## 关键设计点
 
-### Node enrollment
-`secret = sha256(group_id + bot_token)`. Any peer can accept an enrollment.
+### 节点认亲
+`secret = sha256(group_id + bot_token)`。任意 peer 都可接受认亲。
 
-### Sync
-A single monotonically increasing `config_version` integer. Snapshots are
-full-replace, no deltas. A lagging node pulls from the peer with the lowest RTT.
-Proactive push + heartbeat fallback run in parallel.
+### 同步
+单一 `config_version` 单调递增整数。snapshot 全量替换，不做 delta。落后节点从 RTT 最低的 peer 拉。主动推送 + 心跳兜底并行。
 
-### Certificates
-- Sources: LE > upload > self-signed (precision order)
-- IP = domain (no special-casing)
-- Issuing node: `candidates(D) = nodes whose IP is in D's DNS A records;
-  responsible = candidates[hash(D) % len]`
-- Once selected, a cert is not swapped until it expires; on expiry it is
-  immediately re-selected by the precision algorithm
-- Self-signed certs are generated during install.sh, valid 100 years, and do not
-  participate in sync
+### 证书
+- 来源：LE > 上传 > 自签（精度顺序）
+- IP = 域名（零特异化）
+- 申请节点：`candidates(D) = DNS A 记录包含本节点 IP 的节点集；responsible = candidates[hash(D) % len]`
+- 选定后未过期不切换；过期立即按精度算法重选
+- 自签 install.sh 阶段生成、100 年、不参与同步
 
-### Upgrade
-`runtime/` is wiped entirely; only the 4 `persistent/` items survive:
-`identity.json` / `peers.json` / `certs/` / `snapshot.cmd`.
+### 升级
+`runtime/` 全删，仅保留 `persistent/` 4 项：`identity.json` / `peers.json` / `certs/` / `snapshot.cmd`。
 
-### Global port-protocol uniqueness
-Each port has exactly one protocol binding across the whole cluster. A conflict →
-warning + `/confirm`.
+### 端口协议全局统一
+每个端口在全集群有且仅有一个协议绑定。冲突 → 警告 + `/confirm`。
 
-### Multi-binding precision matching
-When a domain binds multiple objects, matching follows precision rules; on a
-precision tie, the "stricter" field value wins (TTL takes the minimum, booleans
-OR together). The matching engine is delegated to nginx — cdn-agent does not
-implement a runtime matcher.
+### 多绑定精度匹配
+同域名绑定多个对象，按精度规则匹配；同精度冲突取"更严格"字段值（TTL 取最小、布尔取 OR）。匹配引擎委托 nginx，cdn-agent 不写运行时匹配。
 
 ---
 
-## Project layout (quick reference)
+## 项目布局速查
 
 ```
-cmd/cdn-agent/main.go               entry point
+cmd/cdn-agent/main.go               入口
 internal/
 ├── identity/      persistent/identity.json
 ├── peers/         persistent/peers.json
 ├── snapshot/      persistent/snapshot.cmd
 ├── db/            runtime/config.db
-├── command/       ★ Muscle layer
-│   ├── types.go         core types + Handler interface + parser
-│   ├── executor.go      batch transactions
-│   ├── portproto.go     global port-protocol table logic
-│   └── handlers/        one file per type
-├── nginx/         generates runtime/nginx/*
-├── cert/          certificate subsystem
-│   ├── store.go         certs/ + manifest.json
-│   ├── selector.go      §3.6 selection algorithm
-│   ├── selfsign.go      self-signed generation
-│   ├── acme/            ACME client
-│   └── renew/           ★ renewal loop (scanner.go + worker.go)
-├── mesh/          ★ Blood layer (client.go, coordinator.go, server.go, upgrade.go)
-├── bot/           Telegram interface (thin layer)
-├── cli/           cdn-agent exec (thin layer)
-├── logs/          access log collection
-└── version/       version + embedded source (version/source/)
+├── command/       ★肌肉层
+│   ├── types.go         核心类型 + Handler 接口 + 解析器
+│   ├── executor.go      批处理事务
+│   └── handlers/        每种 type 一个文件
+├── nginx/         runtime/nginx/* 生成
+├── cert/          证书子系统
+├── mesh/          ★血液层
+├── bot/           Telegram（薄层）
+├── cli/           cdn-agent exec（薄层）
+└── version/       版本 + 嵌入源码
 ```
 
 ---
 
-## Engineering discipline
+## 工程纪律
 
-1. **Package boundary = physical boundary**. One internal package maps to one
-   physical file/directory/concept.
-2. **One type per file under handlers/**. A new feature = a new handler.
-3. **The build must go through source-snapshot**. `make build` copies the source
-   into `internal/version/source/` and embeds it into the binary.
-   `cdn-agent dump-source` can restore it. **A binary without self-contained
-   source must not be released.**
-4. **Handlers do no I/O**. Validate is pure logic; Write/Delete go through the
-   transaction; side effects are reported to the executor via `Effects` for
-   unified handling.
-5. **Within a batch, failures are skipped and execution continues**, but only
-   successful commands advance the version counter.
+1. **包边界 = 物理边界**。一个内部包对应一个物理文件/目录/概念。
+2. **handlers/ 一个 type 一个文件**。新增功能 = 新增一个 handler。
+3. **构建必须经过 source-snapshot**。`make build` 自动 copy 源码到 `source/` 然后 embed 进二进制。`cdn-agent dump-source` 可恢复。**没有源码自包含的二进制不允许 release**。
+4. **handler 不做 I/O**。Validate 纯逻辑、Write/Delete 通过事务、副作用通过 `Effects` 上报给 executor 统一处理。
+5. **batch 内失败跳过继续**，但只有成功命令进版本号。
 
 ---
 
-## Documents to consult
+## 必查文档
 
-- `V4-DESIGN.md` — the full design document (consult as needed)
-- `internal/command/types.go` — all core type definitions of the command system
-  (with detailed comments)
-- This file — the overview (read by default at the start of each session)
+- `V4-DESIGN.md` — 完整设计文档（约 1000 行，按需查阅）
+- `types.go` — 命令系统所有核心类型定义（含详细注释）
+- 本文件 — 总览（每次会话默认读）
 
 ---
 
-**Core creed**: the foundation matters; configuration is commands; commands are
-four segments; nodes are equal; the program's boundary is the information boundary.
+**核心信条**：地基重要、配置即命令、命令即四段、节点平权、程序的边界是信息边界。

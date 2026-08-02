@@ -27,6 +27,7 @@ import (
 	"github.com/example/meshcdn/internal/command/handlers"
 	"github.com/example/meshcdn/internal/db"
 	"github.com/example/meshcdn/internal/identity"
+	"github.com/example/meshcdn/internal/logs"
 	"github.com/example/meshcdn/internal/mesh"
 	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
@@ -107,6 +108,19 @@ func Serve(args []string) error {
 	}
 	defer conn.Close()
 
+	// Task 3: access-stats store (runtime/logs.db) + the collector that tails
+	// nginx's JSON stats log. Best-effort — a stats failure must never take
+	// down the agent, so we log and continue with stats disabled.
+	logsDBPath := pathOverride("MESHCDN_LOGS_DB_PATH", "/etc/meshcdn/runtime/logs.db")
+	statsLogPath := pathOverride("MESHCDN_STATS_LOG", "/etc/meshcdn/runtime/logs/stats.log")
+	var logStore *logs.Store
+	if ls, lerr := logs.Open(logsDBPath); lerr != nil {
+		log.Printf("[logs] open %s failed: %v (/v stats disabled)", logsDBPath, lerr)
+	} else {
+		logStore = ls
+		defer logStore.Close()
+	}
+
 	store, err := cert.NewStore(certsDir)
 	if err != nil {
 		return fmt.Errorf("open cert store: %w", err)
@@ -135,6 +149,18 @@ func Serve(args []string) error {
 	nodeIP := ""
 	if id != nil {
 		nodeIP = id.NodeIP
+	}
+
+	// Bot-node override (Task 4): once /v target sets an explicit bot node, it
+	// wins over the install-time MESHCDN_BOT_DISABLE env — only the designated
+	// node polls Telegram. Takes effect at boot (state-layer scope; live switch
+	// is a follow-up). No override set → env behavior unchanged.
+	if id != nil {
+		if override, oerr := db.GetBotNodeIP(context.Background(), conn); oerr == nil && override != "" {
+			disableBot = override != nodeIP
+			log.Printf("[bot] explicit bot-node override=%s (this node=%s → runs bot: %v)",
+				override, nodeIP, !disableBot)
+		}
 	}
 
 	var meshClient *mesh.Client
@@ -193,13 +219,13 @@ func Serve(args []string) error {
 		return nil
 	}
 
-	upgradeFn := func(ctx context.Context) error {
+	upgradeFn := func(ctx context.Context) (string, error) {
 		if meshClient == nil || id == nil {
-			return fmt.Errorf("mesh disabled")
+			return "", fmt.Errorf("mesh disabled")
 		}
 		all, err := peerMgr.All()
 		if err != nil {
-			return err
+			return "", err
 		}
 		ips := make([]string, 0, len(all))
 		for _, p := range all {
@@ -279,6 +305,7 @@ func Serve(args []string) error {
 		PendingResolver:   pendingResolverFn,
 		OnUpgrade:         upgradeFn,
 		IdentityPath:      identity.Path(),
+		LogStore:          logStore,
 
 		SSLPeerIPs:            sslPeerIPsFn,
 		SSLDelegateExec:       sslDelegateExecFn,
@@ -290,6 +317,43 @@ func Serve(args []string) error {
 	executor := command.NewExecutor(conn, registry).
 		WithNginxIntegration(store, nodeIP, nginxDir).
 		WithSnapshotMaintenance(snapshot.Path(), version.Version)
+
+	// Cache purge wiring (Task 2). CacheDir is emptied on a purge action;
+	// BroadcastExec fans `/v cache - purge-all` out to every peer via /mesh/exec,
+	// each peer clearing its own cache. meshClient is captured by closure since
+	// startMesh assigns it later.
+	executor.CacheDir = pathOverride("MESHCDN_CACHE_DIR", command.DefaultCacheDir)
+	executor.BroadcastExec = func(ctx context.Context, cmdText string) string {
+		if meshClient == nil {
+			return "  (mesh 未就绪，未广播到 peer)"
+		}
+		all, err := peerMgr.All()
+		if err != nil {
+			return fmt.Sprintf("  peer 广播失败: %v", err)
+		}
+		ok, fail, total := 0, 0, 0
+		for _, p := range all {
+			if p.IP == nodeIP {
+				continue
+			}
+			total++
+			req := &mesh.ExecRequest{FromIP: nodeIP, Command: cmdText}
+			resp, err := meshClient.Exec(ctx, p.IP, mesh.DefaultPort, req)
+			if err != nil || resp == nil || !resp.OK {
+				fail++
+				continue
+			}
+			ok++
+		}
+		if total == 0 {
+			return "  集群: 仅本节点 (无其他 peer)"
+		}
+		suffix := ""
+		if fail > 0 {
+			suffix = fmt.Sprintf("，%d 失败(将由后续心跳/手动重试)", fail)
+		}
+		return fmt.Sprintf("  集群广播: 本节点 + %d/%d peer 已清理%s", ok, total, suffix)
+	}
 
 	confirmExecutorRef = executor
 
@@ -331,6 +395,20 @@ func Serve(args []string) error {
 		close(scannerDone)
 	}()
 
+	// Task 3: access-stats collector loop (the "4th loop", V4-DESIGN §A.3).
+	// Tracked with collectorDone so shutdown waits for an in-flight CollectOnce
+	// (esp. a Store.Commit tx) to finish before deferred logStore.Close() runs.
+	collectorDone := make(chan struct{})
+	if logStore != nil {
+		go func() {
+			defer close(collectorDone)
+			collector := &logs.Collector{Store: logStore, LogPath: statsLogPath}
+			collector.Run(ctx)
+		}()
+	} else {
+		close(collectorDone) // nothing to wait for; avoid blocking below
+	}
+
 	pendingDone := make(chan struct{})
 	go func() {
 		t := time.NewTicker(1 * time.Minute)
@@ -368,7 +446,14 @@ func Serve(args []string) error {
 			Client:      meshClient,
 			Port:        mesh.DefaultPort,
 			LocalNodeIP: id.NodeIP,
-			BotNodeIP:   peerMgr.BotNodeIP, // method value
+			// Route alerts to the effective bot node: explicit override if set,
+			// else the join-order default. Follows a /v target transfer.
+			BotNodeIP: func() string {
+				if override, err := db.GetBotNodeIP(context.Background(), conn); err == nil && override != "" {
+					return override
+				}
+				return peerMgr.BotNodeIP()
+			},
 		}
 		worker.AlertSink = sink
 		log.Printf("[alert] worker-node mode: forwarding alerts via mesh to bot node")
@@ -470,6 +555,7 @@ func Serve(args []string) error {
 	}
 	<-workerDone
 	<-scannerDone
+	<-collectorDone
 	<-pendingDone
 	if coordDone != nil {
 		<-coordDone

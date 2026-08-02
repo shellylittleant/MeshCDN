@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -18,6 +19,9 @@ import (
 	"github.com/example/meshcdn/internal/nginx"
 	"github.com/example/meshcdn/internal/snapshot"
 )
+
+// DefaultCacheDir is nginx's proxy_cache_path root (see nginx/templates.go).
+const DefaultCacheDir = "/etc/meshcdn/runtime/cache"
 
 type Executor struct {
 	DB       *sql.DB
@@ -31,6 +35,15 @@ type Executor struct {
 	ProgramVersion string
 
 	NotifyPeers func(newVersion int64)
+
+	// CacheDir is the proxy_cache directory emptied by a purge action.
+	// Empty → DefaultCacheDir.
+	CacheDir string
+
+	// BroadcastExec sends a command to every peer (each runs it locally) and
+	// returns a short human report. Wired only on nodes with a live mesh
+	// client; nil in single-node CLI mode. Used to fan out cache purges.
+	BroadcastExec func(ctx context.Context, cmdText string) string
 }
 
 func NewExecutor(database *sql.DB, registry Registry) *Executor {
@@ -160,7 +173,11 @@ func (e *Executor) ExecuteBatch(ctx context.Context, batchText string) (*BatchRe
 		}
 	}
 
-	if anyMutationSucceeded {
+	// A read-shaped action (e.g. /v target) can change synced cluster state
+	// without any /w or /d; ForceVersionBump makes it count as a mutation.
+	versionBumped := anyMutationSucceeded || result.AggregatedEffects.ForceVersionBump
+
+	if versionBumped {
 		newVersion, err := db.BumpVersion(ctx, tx)
 		if err != nil {
 			_ = tx.Rollback()
@@ -177,7 +194,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, batchText string) (*BatchRe
 		_ = tx.Rollback()
 	}
 
-	if err := e.applyEffects(ctx, &result.AggregatedEffects, anyMutationSucceeded, result.NewVersion); err != nil {
+	if err := e.applyEffects(ctx, &result.AggregatedEffects, versionBumped, result.NewVersion); err != nil {
 		result.AggregatedEffects.UserMessage += fmt.Sprintf("\n⚠️  effects 应用失败: %v", err)
 	}
 
@@ -200,6 +217,12 @@ func (e *Executor) applyEffects(ctx context.Context, eff *Effects, mutated bool,
 		eff.UserMessage += "\n  [nginx 已 reload]"
 	}
 
+	if eff.PurgeCache {
+		if err := e.applyCachePurge(ctx, eff); err != nil {
+			return err
+		}
+	}
+
 	if !mutated {
 		return nil
 	}
@@ -220,6 +243,65 @@ func (e *Executor) applyEffects(ctx context.Context, eff *Effects, mutated bool,
 	}
 
 	return nil
+}
+
+// applyCachePurge empties this node's proxy_cache directory, reloads nginx so it
+// drops stale cache index entries, and — when the effect is a broadcast — fans
+// the purge out to every peer. The cache files are already gone once we return,
+// so a failing nginx reload is a warning, not a hard error (V4-DESIGN §6 info
+// boundary: report the problem, don't pretend the purge failed).
+func (e *Executor) applyCachePurge(ctx context.Context, eff *Effects) error {
+	dir := e.CacheDir
+	if dir == "" {
+		dir = DefaultCacheDir
+	}
+	n, err := purgeCacheDir(dir)
+	if err != nil {
+		return fmt.Errorf("purge cache dir %s: %w", dir, err)
+	}
+	msg := fmt.Sprintf("\n  🧹 本节点缓存已清空 (删除 %d 项 @ %s)", n, dir)
+
+	if e.NginxConfigDir != "" {
+		mainConf := filepath.Join(e.NginxConfigDir, "nginx.conf")
+		if rerr := nginx.ValidateAndReload(mainConf); rerr != nil {
+			msg += fmt.Sprintf("\n  ⚠️ 缓存已删，但 nginx reload 失败 (建议手动 reload): %v", rerr)
+		} else {
+			msg += "\n  [nginx 已 reload]"
+		}
+	}
+
+	if eff.PurgeCacheBroadcast {
+		if e.BroadcastExec != nil {
+			// Peers receive the non-broadcasting form → no re-broadcast storm.
+			msg += "\n" + e.BroadcastExec(ctx, "/v cache - purge-node")
+		} else {
+			msg += "\n  (单机模式，无 peer 广播)"
+		}
+	}
+
+	eff.UserMessage += msg
+	return nil
+}
+
+// purgeCacheDir removes every entry inside dir (but keeps dir itself so nginx's
+// proxy_cache_path stays valid). A missing dir means "nothing cached" → 0, nil.
+func purgeCacheDir(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	removed := 0
+	for _, ent := range entries {
+		p := filepath.Join(dir, ent.Name())
+		if err := os.RemoveAll(p); err != nil {
+			return removed, fmt.Errorf("remove %s: %w", p, err)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // ApplySnapshot replays a snapshot text into the local DB.

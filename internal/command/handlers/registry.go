@@ -10,6 +10,7 @@ import (
 	"github.com/example/meshcdn/internal/cert"
 	"github.com/example/meshcdn/internal/cert/acme"
 	"github.com/example/meshcdn/internal/command"
+	"github.com/example/meshcdn/internal/logs"
 	"github.com/example/meshcdn/internal/peers"
 )
 
@@ -26,12 +27,15 @@ type Dependencies struct {
 	NotifyAll         func(ctx context.Context) error
 	PeerStateProvider func() map[string]PeerHeartbeatState
 	PendingResolver   func(id string) error
-	OnUpgrade         func(ctx context.Context) error
+	OnUpgrade         func(ctx context.Context) (string, error)
 
 	LocalNodeIP string
 
 	// Step 8: identity.json path (used by AIHandler to load/save AI config)
 	IdentityPath string
+
+	// Task 3: this node's logs.db store for /v stats (nil → stats disabled).
+	LogStore *logs.Store
 
 	// Step 10: SSL routing wiring. Optional; when nil, SSLHandler degrades
 	// to single-node behaviour (works fine for clusters where the bot node
@@ -82,11 +86,11 @@ func NewRegistry(deps Dependencies) command.Registry {
 		PeerMgr:           deps.PeerMgr,
 		PeerStateProvider: deps.PeerStateProvider,
 	}
-	r["stats"] = &StatsHandler{}
+	r["stats"] = &StatsHandler{Store: deps.LogStore}
 
 	// System actions
 	r["sync"] = &SyncHandler{NotifyAll: deps.NotifyAll}
-	r["target"] = &TargetHandler{}
+	r["target"] = &TargetHandler{PeerMgr: deps.PeerMgr, LocalNodeIP: deps.LocalNodeIP}
 	r["upgrade"] = &UpgradeHandler{OnUpgrade: deps.OnUpgrade}
 	r["help"] = &HelpHandler{}
 	r["menu"] = &MenuHandler{}

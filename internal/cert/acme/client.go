@@ -117,6 +117,13 @@ func (c *Client) Issue(ctx context.Context, identifier string) (certPEM, keyPEM 
 	return c.IssueWithHooks(ctx, identifier, nil, nil)
 }
 
+// IssueMulti issues a single certificate whose SAN covers EVERY identifier
+// (any mix of DNS names and IPs). This is what renewal uses so a multi-domain
+// cert is not silently shrunk to its CN (V4-DESIGN §3.7). No cluster hooks.
+func (c *Client) IssueMulti(ctx context.Context, identifiers []string) (certPEM, keyPEM []byte, err error) {
+	return c.IssueMultiWithHooks(ctx, identifiers, nil, nil)
+}
+
 // IssueWithHooks is the routed-issue path. The hooks let callers participate
 // in HTTP-01 challenge orchestration:
 //
@@ -134,8 +141,35 @@ func (c *Client) IssueWithHooks(
 	onPresent func(domain, token, keyAuth string) error,
 	onCleanup func(domain, token, keyAuth string) error,
 ) (certPEM, keyPEM []byte, err error) {
+	return c.IssueMultiWithHooks(ctx, []string{identifier}, onPresent, onCleanup)
+}
 
-	isIP := net.ParseIP(identifier) != nil
+// IssueMultiWithHooks is the multi-SAN core. It issues ONE certificate whose
+// SAN covers every identifier (DNS names and/or IPs), with optional cluster
+// HTTP-01 hooks. Single-identifier issuance (Issue/IssueWithHooks) is just the
+// len==1 case; renewal passes the expiring cert's full SAN set so the cert is
+// re-issued intact rather than collapsed to its CN (V4-DESIGN §3.7).
+func (c *Client) IssueMultiWithHooks(
+	ctx context.Context,
+	identifiers []string,
+	onPresent func(domain, token, keyAuth string) error,
+	onCleanup func(domain, token, keyAuth string) error,
+) (certPEM, keyPEM []byte, err error) {
+
+	if len(identifiers) == 0 {
+		return nil, nil, errors.New("no identifiers to issue")
+	}
+
+	// Split identifiers into DNS names and IPs.
+	var dnsNames []string
+	var ips []net.IP
+	for _, id := range identifiers {
+		if ip := net.ParseIP(id); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			dnsNames = append(dnsNames, id)
+		}
+	}
 
 	leClient, err := c.getLegoClient()
 	if err != nil {
@@ -149,17 +183,20 @@ func (c *Client) IssueWithHooks(
 		return nil, nil, fmt.Errorf("set http01 provider: %w", err)
 	}
 
-	if isIP {
-		return c.issueForIP(leClient, identifier)
+	// Any IP in the SAN set forces the CSR path + shortlived profile: LE
+	// requires the shortlived profile for IP certs and rejects a CN holding
+	// an IP literal (badCSR). Pure-DNS certs take lego's standard Obtain path.
+	if len(ips) > 0 {
+		return c.issueForCSR(leClient, dnsNames, ips)
 	}
 
 	req := certificate.ObtainRequest{
-		Domains: []string{identifier},
+		Domains: dnsNames,
 		Bundle:  true,
 	}
 	resource, err := leClient.Certificate.Obtain(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("obtain cert for %s: %w", identifier, err)
+		return nil, nil, fmt.Errorf("obtain cert for %v: %w", dnsNames, err)
 	}
 	if len(resource.Certificate) == 0 || len(resource.PrivateKey) == 0 {
 		return nil, nil, errors.New("ACME returned empty cert or key")
@@ -167,14 +204,13 @@ func (c *Client) IssueWithHooks(
 	return resource.Certificate, resource.PrivateKey, nil
 }
 
-// issueForIP builds a CSR with empty CommonName + IP in SAN, then calls
-// ObtainForCSR with profile=shortlived. This bypasses lego's default
-// behaviour of putting the first domain into the CSR's Common Name —
-// LE rejects CN containing an IP literal (badCSR).
-func (c *Client) issueForIP(leClient *lego.Client, ipStr string) (certPEM, keyPEM []byte, err error) {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return nil, nil, fmt.Errorf("not a valid IP: %s", ipStr)
+// issueForCSR builds a CSR with empty CommonName carrying all DNS names and IPs
+// in SAN, then calls ObtainForCSR with profile=shortlived. Empty CN bypasses
+// lego's default of putting the first identifier into the CN — LE rejects a CN
+// containing an IP literal (badCSR). Used whenever the SAN set includes ≥1 IP.
+func (c *Client) issueForCSR(leClient *lego.Client, dnsNames []string, ips []net.IP) (certPEM, keyPEM []byte, err error) {
+	if len(ips) == 0 && len(dnsNames) == 0 {
+		return nil, nil, errors.New("issueForCSR: no identifiers")
 	}
 
 	// Generate a fresh ECDSA P-256 private key for this cert
@@ -183,10 +219,11 @@ func (c *Client) issueForIP(leClient *lego.Client, ipStr string) (certPEM, keyPE
 		return nil, nil, fmt.Errorf("generate cert key: %w", err)
 	}
 
-	// Build a CSR: empty Subject, IP in SAN
+	// Build a CSR: empty Subject, all identifiers in SAN
 	template := x509.CertificateRequest{
 		Subject:     pkix.Name{}, // intentionally empty — no CommonName
-		IPAddresses: []net.IP{ip},
+		DNSNames:    dnsNames,
+		IPAddresses: ips,
 	}
 	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &template, priv)
 	if err != nil {
@@ -204,7 +241,7 @@ func (c *Client) issueForIP(leClient *lego.Client, ipStr string) (certPEM, keyPE
 	}
 	resource, err := leClient.Certificate.ObtainForCSR(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("obtain cert for %s: %w", ipStr, err)
+		return nil, nil, fmt.Errorf("obtain cert for dns=%v ip=%v: %w", dnsNames, ips, err)
 	}
 	if len(resource.Certificate) == 0 {
 		return nil, nil, errors.New("ACME returned empty cert")

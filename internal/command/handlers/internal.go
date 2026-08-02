@@ -36,6 +36,7 @@ import (
 	"strings"
 
 	"github.com/example/meshcdn/internal/command"
+	"github.com/example/meshcdn/internal/db"
 	"github.com/example/meshcdn/internal/peers"
 )
 
@@ -80,6 +81,20 @@ func (h *InternalHandler) Validate(cmd *command.Command) error {
 				return command.NewError(command.ErrBadParams,
 					fmt.Sprintf("invalid join_order: %q", fields[1]))
 			}
+		}
+		return nil
+
+	case "set-bot":
+		// params: "<ip>" (set override) or "-" (clear). Snapshot-replayable
+		// form of /v target; the user-facing validation lives in TargetHandler.
+		fields := strings.Fields(cmd.Params)
+		if len(fields) < 1 {
+			return command.NewError(command.ErrBadParams,
+				"/w internal set-bot requires <ip> or -")
+		}
+		if fields[0] != "-" && net.ParseIP(fields[0]) == nil {
+			return command.NewError(command.ErrBadFormat,
+				fmt.Sprintf("invalid IP: %q", fields[0]))
 		}
 		return nil
 
@@ -146,6 +161,21 @@ func (h *InternalHandler) Write(tx *sql.Tx, cmd *command.Command) (command.Effec
 		return command.Effects{
 			UserMessage: fmt.Sprintf("peer 已移除: %s", ip),
 		}, nil
+
+	case "set-bot":
+		// Persist the explicit bot-node override (or clear it with "-").
+		ip := fields[0]
+		if ip == "-" {
+			ip = ""
+		}
+		if err := db.SetBotNodeIP(context.Background(), tx, ip); err != nil {
+			return command.Effects{}, err
+		}
+		msg := fmt.Sprintf("bot 节点已设为 %s", ip)
+		if ip == "" {
+			msg = "bot 节点覆盖已清除 (回退到 join_order 默认)"
+		}
+		return command.Effects{UserMessage: msg}, nil
 	}
 
 	return command.Effects{}, command.NewError(command.ErrBadFormat,

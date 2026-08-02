@@ -16,11 +16,19 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/example/meshcdn/internal/command"
 )
+
+// uaReDoSHeuristic flags User-Agent regexes with a quantified group whose body
+// itself ends in an unbounded quantifier — the classic catastrophic-backtracking
+// shape, e.g. "(a+)+", "(a*)*", "(a+){2,}", "(\d+)+". This is a heuristic, not a
+// proof: it deliberately errs toward rejecting the well-known evil forms rather
+// than trying to decide ReDoS in general (which is undecidable).
+var uaReDoSHeuristic = regexp.MustCompile(`[+*}]\)[*+{]`)
 
 // ─────────────────────────────────────────────────────────────────────
 // Defense (block / allow rules)
@@ -82,12 +90,18 @@ func parseDefenseParams(text string) (*DefenseParams, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectUnknownKeys(m, "defense", "ip", "ua", "ref", "action", "duration", "rate", "size"); err != nil {
+		return nil, err
+	}
 	out := &DefenseParams{Action: "block"} // default
 
 	if v, ok := m["ip"]; ok && v != "" {
 		out.IP = splitCSV(v)
 	}
 	if v, ok := m["ua"]; ok {
+		if err := validateUARegex(v); err != nil {
+			return nil, err
+		}
 		out.UA = v
 	}
 	if v, ok := m["ref"]; ok && v != "" {
@@ -187,6 +201,9 @@ func parseRedirectParams(text string) (*RedirectParams, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectUnknownKeys(m, "redirect", "from", "to", "status", "regex"); err != nil {
+		return nil, err
+	}
 	out := &RedirectParams{Status: 301}
 	if v, ok := m["from"]; ok {
 		out.From = v
@@ -275,6 +292,9 @@ func (h *HeaderHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 func parseHeaderParams(text string) (*HeaderParams, error) {
 	m, err := command.ParseKeyValueParams(text)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectUnknownKeys(m, "header", "request_add", "request_del", "response_add", "response_del"); err != nil {
 		return nil, err
 	}
 	out := &HeaderParams{}
@@ -484,6 +504,60 @@ func viewRuleObject(tx *sql.Tx, typeName string, cmd *command.Command,
 	}
 
 	return command.Effects{UserMessage: sb.String()}, nil
+}
+
+// rejectUnknownKeys fails a B-class object parse when it carries a key the
+// handler does not understand. Previously unknown keys were silently dropped,
+// so a typo (or an as-yet-unimplemented feature like geo=/cc=) would "succeed"
+// while doing nothing — a silent-failure trap. geo/cc get a dedicated message
+// because they appear in older docs but are not implemented anywhere.
+func rejectUnknownKeys(m map[string]string, typeName string, allowed ...string) error {
+	allow := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		allow[k] = true
+	}
+	for k := range m {
+		if allow[k] {
+			continue
+		}
+		switch k {
+		case "geo", "cc":
+			return fmt.Errorf("%s: 参数 %q 尚未实现（geo 地理封禁 / cc 防护仍在路线图待定区），请勿使用以免误以为已生效", typeName, k)
+		default:
+			return fmt.Errorf("%s: 未知参数 %q（允许: %s）", typeName, k, strings.Join(allowed, ", "))
+		}
+	}
+	return nil
+}
+
+// validateUARegex rejects User-Agent patterns that are unsafe to compile into
+// the OpenResty access_by_lua_block. The pattern is always embedded as a Lua
+// *string* (never as code) and matched with ngx.re.match, but we still sanitize
+// defensively: length bound, no control characters, no catastrophic-backtracking
+// shape, and it must be a syntactically valid regexp. Rejecting here (Validate
+// stage) means a bad pattern never reaches nginx config generation.
+func validateUARegex(pat string) error {
+	if pat == "" {
+		return nil
+	}
+	if len(pat) > 256 {
+		return fmt.Errorf("ua 正则过长（%d > 256 字符）", len(pat))
+	}
+	for _, r := range pat {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("ua 正则包含控制字符 %U，已拒绝", r)
+		}
+	}
+	if uaReDoSHeuristic.MatchString(pat) {
+		return fmt.Errorf("ua 正则 %q 具有灾难性回溯（ReDoS）结构，请拆解嵌套量词后重试", pat)
+	}
+	// RE2 has no backtracking constructs, so a successful compile here also rules
+	// out backreferences/lookaround — additional ReDoS-vector protection. PCRE-only
+	// constructs are rare in UA matching and rejecting them is the safe default.
+	if _, err := regexp.Compile(pat); err != nil {
+		return fmt.Errorf("ua 正则 %q 非法: %v", pat, err)
+	}
+	return nil
 }
 
 // splitCSV splits "a, b, c" → ["a", "b", "c"], trimming whitespace.

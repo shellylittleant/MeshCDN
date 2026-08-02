@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -314,11 +315,17 @@ func applyBindings(p *DomainPolicy, bindings []rawBinding) {
 				p.Defenses.RateLimit = d.Rate
 			}
 			if d.Size != "" {
+				// Stricter-wins (V4-DESIGN §8.6): a SMALLER max body size is more
+				// restrictive. Parse both to bytes and keep the smaller, same as
+				// ttl. (Previously this was first-by-name-wins, which could let a
+				// looser 1g override a stricter 10m.)
 				if p.Defenses.BodySize == "" {
 					p.Defenses.BodySize = d.Size
+				} else if nw, nwOK := parseSizeToBytes(d.Size); nwOK {
+					if cur, curOK := parseSizeToBytes(p.Defenses.BodySize); !curOK || nw < cur {
+						p.Defenses.BodySize = d.Size
+					}
 				}
-				// Note: comparing "10m" < "1g" needs unit parsing; step 6
-				// keeps it simple: first one wins. Step 7 polish.
 			}
 
 		case "redirect":
@@ -414,6 +421,33 @@ func patternToNginxLocation(pattern string) (modifier, matcher string, precedenc
 
 	// 6) Otherwise: treat as exact filename match (regex anchor at end)
 	return "~*", `(^|/)` + pattern + `$`, 3
+}
+
+// parseSizeToBytes parses an nginx size string ("10m", "1G", "500k", or bare
+// bytes "1024") into a byte count. Returns ok=false if the format is invalid.
+// Matches nginx's client_max_body_size grammar: digits + optional k/m/g suffix.
+func parseSizeToBytes(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		mult = 1024
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		mult = 1024 * 1024
+		s = s[:len(s)-1]
+	case 'g', 'G':
+		mult = 1024 * 1024 * 1024
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n * mult, true
 }
 
 // pathPrecedence returns precedence rank for a redirect path.

@@ -14,11 +14,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/example/meshcdn/internal/command"
 	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/logs"
 	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
 )
@@ -150,9 +152,18 @@ func (h *StatusHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 		peerCount = len(all)
 	}
 
+	botIP := effectiveBotIP(ctx, tx, h.PeerMgr)
+	botLabel := botIP
+	if botIP == "" {
+		botLabel = "(未知)"
+	} else if botIP == h.NodeIP {
+		botLabel = botIP + " (本节点)"
+	}
+
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "MeshCDN 节点状态\n")
 	fmt.Fprintf(&sb, "  节点 IP:        %s\n", h.NodeIP)
+	fmt.Fprintf(&sb, "  bot 节点:       %s\n", botLabel)
 	fmt.Fprintf(&sb, "  程序版本:       %s\n", h.ProgramVersion)
 	fmt.Fprintf(&sb, "  config_version: %d\n", v)
 	fmt.Fprintf(&sb, "  集群节点数:     %d\n", peerCount)
@@ -162,6 +173,20 @@ func (h *StatusHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 	fmt.Fprintf(&sb, "  当前时间:       %s\n", time.Now().UTC().Format(time.RFC3339))
 
 	return command.Effects{UserMessage: sb.String()}, nil
+}
+
+// effectiveBotIP resolves which node currently owns the bot role: the explicit
+// cluster_meta.bot_node_ip override if set, otherwise the join-order default
+// (lowest join_order, via peers.BotNodeIP). This is the single source of truth
+// shared by status/nodes display, alert routing, and the boot gate.
+func effectiveBotIP(ctx context.Context, q db.Querier, pm *peers.Manager) string {
+	if override, err := db.GetBotNodeIP(ctx, q); err == nil && override != "" {
+		return override
+	}
+	if pm != nil {
+		return pm.BotNodeIP()
+	}
+	return ""
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -239,8 +264,13 @@ func (h *NodesHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 		}, nil
 	}
 
-	fmt.Fprintf(&sb, "集群节点 (%d):\n", len(all))
+	botIP := effectiveBotIP(context.Background(), tx, h.PeerMgr)
+	fmt.Fprintf(&sb, "集群节点 (%d)  ⭐=bot:\n", len(all))
 	for _, p := range all {
+		mark := "  "
+		if p.IP == botIP {
+			mark = "⭐"
+		}
 		st, ok := states[p.IP]
 		if ok {
 			rttStr := "—"
@@ -253,10 +283,10 @@ func (h *NodesHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 			} else if st.ConsecutiveFailures > 0 {
 				status = "degraded"
 			}
-			fmt.Fprintf(&sb, "  [%d] %-15s  v%-4d  rtt=%-10s  %s\n",
-				p.JoinOrder, p.IP, st.ConfigVersion, rttStr, status)
+			fmt.Fprintf(&sb, "%s [%d] %-15s  v%-4d  rtt=%-10s  %s\n",
+				mark, p.JoinOrder, p.IP, st.ConfigVersion, rttStr, status)
 		} else {
-			fmt.Fprintf(&sb, "  [%d] %-15s  (local or no data)\n", p.JoinOrder, p.IP)
+			fmt.Fprintf(&sb, "%s [%d] %-15s  (local or no data)\n", mark, p.JoinOrder, p.IP)
 		}
 	}
 
@@ -264,10 +294,21 @@ func (h *NodesHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// /v stats — traffic stats (stub for step 5; real impl in step 7)
+// /v stats — traffic stats from logs.db (this node only)
+//
+//	/v stats -        -         全部域名, 近 24h
+//	/v stats a.com    -         单域名, 近 24h
+//	/v stats a.com    7d        单域名, 近 7 天  (窗口: Nh / Nd / Go duration)
+//
+// Single-node scope (V4-DESIGN task 3 阶段 3.2): numbers reflect requests this
+// node served. Cross-node aggregation (3.3) is a follow-up.
 // ─────────────────────────────────────────────────────────────────────
 
-type StatsHandler struct{}
+type StatsHandler struct {
+	// Store is this node's logs.db. nil when the collector isn't running
+	// (e.g. mesh/nginx disabled), in which case /v stats reports "未启用".
+	Store *logs.Store
+}
 
 func (h *StatsHandler) Type() string { return "stats" }
 
@@ -289,7 +330,98 @@ func (h *StatsHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects
 	return command.Effects{}, command.NewError(command.ErrBadFormat, "stats is read-only")
 }
 func (h *StatsHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
-	return command.Effects{
-		UserMessage: "stats: 流量统计将在 step 7 实现 (依赖 logs.db 收集器)",
-	}, nil
+	if h.Store == nil {
+		return command.Effects{
+			UserMessage: "stats: 未启用 (本节点未运行日志采集，需 serve 模式 + nginx)",
+		}, nil
+	}
+	ctx := context.Background()
+
+	window := parseStatsWindow(cmd.Params)
+	since := time.Now().Add(-window).Truncate(time.Minute).Unix()
+
+	domain := ""
+	if !command.IsPlaceholder(cmd.Scope) {
+		domain = cmd.Scope
+	}
+
+	rows, err := h.Store.StatusBreakdown(ctx, domain, since)
+	if err != nil {
+		return command.Effects{}, fmt.Errorf("stats query: %w", err)
+	}
+
+	scopeLabel := domain
+	if scopeLabel == "" {
+		scopeLabel = "全部域名"
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📊 流量统计 (%s, 近 %s, 本节点)\n", scopeLabel, humanWindow(window))
+
+	var totalHits, totalBytes int64
+	for _, r := range rows {
+		totalHits += r.Hits
+		totalBytes += r.Bytes
+	}
+	if totalHits == 0 {
+		sb.WriteString("  (窗口内无数据)\n")
+		return command.Effects{UserMessage: sb.String()}, nil
+	}
+
+	fmt.Fprintf(&sb, "  总请求: %d\n", totalHits)
+	fmt.Fprintf(&sb, "  总流量: %s\n", humanBytes(totalBytes))
+	sb.WriteString("  状态码分布:\n")
+	for _, r := range rows {
+		fmt.Fprintf(&sb, "    %d: %d (%.1f%%)\n",
+			r.Status, r.Hits, 100*float64(r.Hits)/float64(totalHits))
+	}
+
+	if domain == "" {
+		tops, err := h.Store.TopDomains(ctx, since, 10)
+		if err == nil && len(tops) > 0 {
+			sb.WriteString("  域名 Top:\n")
+			for _, t := range tops {
+				fmt.Fprintf(&sb, "    %-24s %d 次  %s\n", t.Domain, t.Hits, humanBytes(t.Bytes))
+			}
+		}
+	}
+
+	return command.Effects{UserMessage: sb.String()}, nil
+}
+
+// parseStatsWindow accepts "Nd" (days), "Nh"/Go durations, or "-"/"" (→ 24h).
+func parseStatsWindow(params string) time.Duration {
+	p := strings.TrimSpace(params)
+	if p == "" || p == "-" {
+		return 24 * time.Hour
+	}
+	if strings.HasSuffix(p, "d") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(p, "d")); err == nil && n > 0 {
+			return time.Duration(n) * 24 * time.Hour
+		}
+	}
+	if d, err := time.ParseDuration(p); err == nil && d > 0 {
+		return d
+	}
+	return 24 * time.Hour
+}
+
+func humanWindow(d time.Duration) string {
+	if d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%dd", d/(24*time.Hour))
+	}
+	return d.String()
+}
+
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }

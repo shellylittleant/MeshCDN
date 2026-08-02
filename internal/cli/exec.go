@@ -13,6 +13,7 @@ import (
 	"github.com/example/meshcdn/internal/command/handlers"
 	"github.com/example/meshcdn/internal/db"
 	"github.com/example/meshcdn/internal/identity"
+	"github.com/example/meshcdn/internal/logs"
 	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
 	"github.com/example/meshcdn/internal/version"
@@ -77,6 +78,15 @@ func Exec(args []string) error {
 		return fmt.Errorf("open peers.json: %w", err)
 	}
 
+	// Task 3: open logs.db read-side so `/v stats` works from the CLI too.
+	// Best-effort — absence just means stats reports "未启用".
+	logsDBPath := pathOverride("MESHCDN_LOGS_DB_PATH", "/etc/meshcdn/runtime/logs.db")
+	var logStore *logs.Store
+	if ls, lerr := logs.Open(logsDBPath); lerr == nil {
+		logStore = ls
+		defer logStore.Close()
+	}
+
 	nodeIP := loadNodeIPBestEffort()
 
 	registry := handlers.NewRegistry(handlers.Dependencies{
@@ -88,10 +98,12 @@ func Exec(args []string) error {
 		PeerMgr:        peerMgr,
 		LocalNodeIP:    nodeIP,
 		IdentityPath:   identity.Path(),
+		LogStore:       logStore,
 	})
 
 	executor := command.NewExecutor(conn, registry).
 		WithSnapshotMaintenance(snapshot.Path(), version.Version)
+	executor.CacheDir = pathOverride("MESHCDN_CACHE_DIR", command.DefaultCacheDir)
 	if !skipNginx {
 		executor.WithNginxIntegration(store, nodeIP, nginxDir)
 	}

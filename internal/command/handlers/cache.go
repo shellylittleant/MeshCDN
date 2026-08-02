@@ -80,6 +80,9 @@ func (h *CacheHandler) Validate(cmd *command.Command) error {
 		if err != nil {
 			return err
 		}
+		if err := rejectUnknownKeys(params, "cache", "patterns", "ttl", "browser_ttl", "hsts"); err != nil {
+			return command.NewError(command.ErrBadParams, err.Error())
+		}
 		patternsStr, ok := params["patterns"]
 		if !ok || patternsStr == "" {
 			return command.NewError(command.ErrBadParams,
@@ -204,6 +207,27 @@ func (h *CacheHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 	ctx := context.Background()
 	var sb strings.Builder
 
+	// Cache purge is a read-shaped action (like /v sync): no DB write, no
+	// config_version bump. `/v cache - purge-all` clears this node and fans out
+	// to the cluster; `/v cache - purge-node` (the fan-out form) clears only the
+	// local node. The executor performs the actual filesystem + nginx work via
+	// the PurgeCache effect.
+	if command.IsPlaceholder(cmd.Scope) {
+		switch strings.TrimSpace(cmd.Params) {
+		case "purge-all":
+			return command.Effects{
+				PurgeCache:          true,
+				PurgeCacheBroadcast: true,
+				UserMessage:         "🧹 集群缓存清理已触发",
+			}, nil
+		case "purge-node":
+			return command.Effects{
+				PurgeCache:  true,
+				UserMessage: "🧹 本节点缓存清理已触发",
+			}, nil
+		}
+	}
+
 	if command.IsPlaceholder(cmd.Scope) {
 		// list all
 		rows, err := tx.QueryContext(ctx,
@@ -285,6 +309,9 @@ func (h *CacheHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 func parseCacheParams(text string) (*CacheParams, error) {
 	m, err := command.ParseKeyValueParams(text)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectUnknownKeys(m, "cache", "patterns", "ttl", "browser_ttl", "hsts"); err != nil {
 		return nil, err
 	}
 	out := &CacheParams{}

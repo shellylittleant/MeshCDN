@@ -106,11 +106,19 @@ func (s *Scanner) RunOnce() error {
 			continue
 		}
 
-		// Enqueue (worker handles dedup by fingerprint)
+		// Enqueue (worker handles dedup by fingerprint). Carry the FULL SAN
+		// set so renewal re-issues the cert intact — using only the subject
+		// (CN) would shrink a multi-domain cert to one name (V4-DESIGN §3.7).
+		ids := renewalIdentifiers(cm)
+		primary := cm.Subject
+		if primary == "" && len(ids) > 0 {
+			primary = ids[0] // IP certs carry an empty CN; fall back to first SAN
+		}
 		s.Worker.Enqueue(Task{
 			Type:        TaskRenew,
 			Fingerprint: cm.FingerprintPrefix,
-			Identifier:  cm.Subject, // primary identifier is the subject
+			Identifier:  primary,
+			Identifiers: ids,
 			Source:      cm.Source,
 		})
 		enqueued++
@@ -120,6 +128,27 @@ func (s *Scanner) RunOnce() error {
 		log.Printf("[renew/scanner] enqueued %d renewal tasks", enqueued)
 	}
 	return nil
+}
+
+// renewalIdentifiers returns the deduplicated identifier set to re-issue for a
+// cert: its subject (CN) unioned with every SAN entry. This is what preserves a
+// multi-domain cert across renewal — issuing from cm.Subject alone would drop
+// every SAN but the CN. Order is stable (CN first, then SANs as stored).
+func renewalIdentifiers(cm cert.CertMeta) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	add(cm.Subject) // empty for IP certs — add() ignores ""
+	for _, san := range cm.SAN {
+		add(san)
+	}
+	return out
 }
 
 // selectedFingerprints returns the set of fingerprints currently in use.

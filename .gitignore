@@ -1,0 +1,17 @@
+# Build artifacts
+/cdn-agent
+/dist/
+/meshcdn-*.tar.gz
+
+# Source snapshot (repopulated by `make source-snapshot` before every build).
+# Only the placeholder is tracked; the copied tree is a build artifact.
+/source/
+/internal/version/source/*
+!/internal/version/source/PLACEHOLDER
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

@@ -208,6 +208,34 @@ func BumpVersion(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return CurrentVersion(ctx, tx)
 }
 
+// GetBotNodeIP reads cluster_meta.bot_node_ip. Empty string means "no explicit
+// override" — callers then fall back to the join-order default (peers.BotNodeIP).
+// See V4-DESIGN §5.3 (bot 节点确定 / 手动转移).
+func GetBotNodeIP(ctx context.Context, q Querier) (string, error) {
+	var ip sql.NullString
+	err := q.QueryRowContext(ctx, "SELECT bot_node_ip FROM cluster_meta WHERE id = 1").Scan(&ip)
+	if err != nil {
+		return "", fmt.Errorf("read bot_node_ip: %w", err)
+	}
+	return ip.String, nil
+}
+
+// SetBotNodeIP sets (or, with ip=="", clears) the explicit bot-node override.
+// This is a config mutation: it must run inside the batch tx so the version
+// bump and snapshot export capture it and the cluster converges.
+func SetBotNodeIP(ctx context.Context, tx *sql.Tx, ip string) error {
+	var val interface{}
+	if ip != "" {
+		val = ip
+	} // else nil → SQL NULL (clear override)
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE cluster_meta SET bot_node_ip = ? WHERE id = 1", val,
+	); err != nil {
+		return fmt.Errorf("set bot_node_ip: %w", err)
+	}
+	return nil
+}
+
 // Querier is the common subset of *sql.DB and *sql.Tx that read helpers use.
 type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row

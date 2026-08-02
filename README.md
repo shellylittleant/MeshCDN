@@ -8,6 +8,7 @@ provider, without a central control plane, and without exposing any management
 interface to the public internet.
 
 > **Version note**
+> Current release: **v4.3.0**.
 > This is **MeshCDN v4**, a complete ground-up rewrite in Go. Earlier v2.x/v3.x
 > lines were a different codebase; their documentation is preserved under the
 > release [`v3.1.0`](../../releases/tag/v3.1.0) for historical reference. v4
@@ -219,11 +220,40 @@ What's working:
 - File-based config export/import via Telegram
 - Cluster-wide upgrades; `runtime/` rebuilt from `persistent/`
 
+New in v4.3.0:
+
+- **Verified, reversible cluster upgrades** — `/v upgrade` now polls peer
+  heartbeats for the new `program_version` and reports "N/M confirmed +
+  failure list" instead of acknowledging at dispatch time. Each peer backs up
+  its previous binary and is supervised by an independent `systemd-run`
+  watchdog that restores it if the restart is unhealthy. (Rollback protection
+  applies from the *next* upgrade onward, since the watchdog ships in the
+  binary already running on the receiving node.)
+- **Per-node traffic statistics** — `/v stats [domain] [24h|7d]` over a new
+  `logs.db`, aggregated per `(domain, minute, status)` from an incremental
+  tail of nginx's JSON stats log. Collection sits outside the request path;
+  7-day retention.
+- **Cluster cache purge** — `/v cache - purge-all` clears every node and
+  reloads; read-shaped, so it does not consume a config version.
+- **Working User-Agent defense** — `ua=` regexes bound to a server merge into
+  a single `access_by_lua_block`, with parse-time rejection of invalid,
+  control-character, and catastrophic-backtracking patterns.
+- **Multi-SAN certificate renewal** — renewal now uses `{Subject} ∪ SAN`, so
+  a multi-domain certificate is no longer silently reduced to its CN.
+- **Bot role transfer** — `/v target <ip>` moves the Telegram-facing role via
+  a replicated `bot_node_ip` override (takes effect on the target's next
+  agent restart).
+- Stricter-wins merging for `size=` limits; closed parameter key sets on all
+  rule objects (unknown keys now error instead of being dropped silently).
+
 Not yet rebuilt from v3.x (planned):
 
 - Rule templates (`#name` references) — superseded by the object/bind model
 - Smart origin routing (ordered failover paths through peers)
 - Bulk origin replacement, node-level redirects
+- Cross-node statistics aggregation (`/v stats` is per-node today)
+- `geo=` GeoIP blocking and `cc=` sliding-window protection (keys reserved;
+  currently return an explicit "not implemented" error)
 
 ---
 
@@ -231,6 +261,7 @@ Not yet rebuilt from v3.x (planned):
 
 | Document | Topic |
 |---|---|
+| [Product Specification (PDF)](docs/MeshCDN-v4.3.0-Product-Specification.pdf) | Design philosophy, architecture, and the full feature catalogue — the best place to start if you want to understand *why* the system is shaped this way |
 | [docs/V4-DESIGN.md](docs/V4-DESIGN.md) | The V4 "constitution": architecture, command grammar, schema, design rationale |
 | [docs/AI-PRIMER.md](docs/AI-PRIMER.md) | Condensed overview of the system — start here if you're an AI tool or a new contributor |
 
