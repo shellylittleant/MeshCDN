@@ -79,13 +79,15 @@ The install script handles everything in one shot: installs Go if needed
 installs OpenResty + systemd units. Tested on **Ubuntu 22.04+**.
 
 ```bash
-git clone https://github.com/shellylittleant/MeshCDN.git
-cd MeshCDN
-
-sudo bash scripts/install.sh \
-  --bot-token="<your_telegram_bot_token>" \
-  --group-id="<your_telegram_group_id>"
+curl -fsSL https://raw.githubusercontent.com/shellylittleant/MeshCDN/main/scripts/quick-install.sh \
+  | sudo bash -s -- \
+      --bot-token=<your_telegram_bot_token> \
+      --group-id=<your_telegram_group_id>
 ```
+
+It resolves the latest release, verifies the download against the release's
+`SHA256SUMS`, installs OpenResty and both systemd units, and generates the
+self-signed fallback certificate.
 
 Then, in your Telegram group:
 
@@ -108,18 +110,28 @@ That's it — `example.com` → `1.2.3.4:443` is now served with auto-renewing S
 On the new machine, point it at any existing peer using the same one-command flow:
 
 ```bash
-git clone https://github.com/shellylittleant/MeshCDN.git
-cd MeshCDN
-
-sudo bash scripts/bootstrap.sh \
-  --bot-token="<token>" \
-  --group-id="<group_id>" \
-  --peer="<existing-node-ip>"
+curl -fsSL https://raw.githubusercontent.com/shellylittleant/MeshCDN/main/scripts/quick-install.sh \
+  | sudo bash -s -- \
+      --bot-token=<token> \
+      --group-id=<group_id> \
+      --peer=<any-live-node-ip>
 ```
 
-`bootstrap.sh` chains into `install.sh` internally, so it inherits the same
-auto-build behavior. The new node authenticates via a shared secret derived from
+Same command as above plus `--peer`; that flag is what switches it from
+"start a new cluster" to "join this one". Any live peer works as the
+introducer — the bot node does not need to be up.
+
+The new node authenticates with a shared secret derived from
 `sha256(group_id + bot_token)`, pulls the full config, and joins the mesh.
+
+To move an already-installed node to a newer build, use `upgrade-node.sh`
+instead — it backs up the current binary and rolls back if the agent does not
+come back up:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shellylittleant/MeshCDN/main/scripts/upgrade-node.sh \
+  | sudo bash
+```
 
 ---
 

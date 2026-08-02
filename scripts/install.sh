@@ -32,18 +32,29 @@ OPENRESTY_NGINX="$OPENRESTY_PATH/nginx/sbin/nginx"
 
 BOT_TOKEN=""
 GROUP_ID=""
-PEER_IP=""
 SKIP_OPENRESTY="false"
 
 for arg in "$@"; do
     case $arg in
         --bot-token=*)    BOT_TOKEN="${arg#*=}" ;;
         --group-id=*)     GROUP_ID="${arg#*=}" ;;
-        --peer=*)         PEER_IP="${arg#*=}" ;;
+        # install.sh sets up a standalone node; it has never performed the
+        # /mesh/auth handshake. Accepting --peer here and ignoring it meant an
+        # operator could run the join command, see "install complete", and be
+        # left with a node that never joined anything.
+        --peer=*)
+            echo "ERROR: install.sh does not join clusters — --peer is handled by bootstrap.sh." >&2
+            echo "  To join an existing cluster:" >&2
+            echo "    bash bootstrap.sh --bot-token=<TOKEN> --group-id=<ID> --peer=${arg#*=}" >&2
+            echo "  or, from a fresh machine:" >&2
+            echo "    curl -fsSL https://raw.githubusercontent.com/shellylittleant/MeshCDN/main/scripts/quick-install.sh \\" >&2
+            echo "      | sudo bash -s -- --bot-token=<TOKEN> --group-id=<ID> --peer=${arg#*=}" >&2
+            exit 1
+            ;;
         --skip-openresty) SKIP_OPENRESTY="true" ;;
         *)
             echo "Unknown argument: $arg" >&2
-            echo "Usage: sudo bash install.sh --bot-token=<TOKEN> --group-id=<ID> [--peer=<IP>]" >&2
+            echo "Usage: sudo bash install.sh --bot-token=<TOKEN> --group-id=<ID> [--skip-openresty]" >&2
             exit 1
             ;;
     esac
