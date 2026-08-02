@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -620,8 +621,21 @@ func startMesh(
 		}
 		return out, nil
 	}
+	// OnRemoteAhead fires once per peer that reports a higher config_version,
+	// and the heartbeat pings every peer concurrently — so on a large cluster a
+	// single round where this node is behind used to launch one pull per peer
+	// ahead, all of them wiping and rebuilding the same nginx directory at
+	// once. Collapse them: one pull at a time, the rest are dropped. A pull
+	// fetches the *latest* snapshot, not a per-peer delta, so a dropped
+	// trigger costs nothing — and anything still missing is picked up by the
+	// next heartbeat or notify-version.
+	var pullInFlight int32
 	coord.OnRemoteAhead = func(peerIP string, remoteVersion int64) {
+		if !atomic.CompareAndSwapInt32(&pullInFlight, 0, 1) {
+			return // a pull is already running; it will fetch at least this version
+		}
 		go func() {
+			defer atomic.StoreInt32(&pullInFlight, 0)
 			pullCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			if err := coord.PullFromBest(pullCtx, remoteVersion); err != nil {

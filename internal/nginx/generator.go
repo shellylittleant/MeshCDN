@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -22,12 +23,40 @@ import (
 
 const DefaultDir = "/etc/meshcdn/runtime/nginx"
 
+// generateMu serialises Generate across the whole process.
+//
+// Every caller (command execution, snapshot replay, boot) targets the same
+// OutputDir, and Generate necessarily destroys and rebuilds it. Two concurrent
+// runs interleave destructively: one walks the tree removing files while the
+// other creates them, so the removal fails with ENOTEMPTY *after* it has
+// already deleted nginx.conf — leaving the node with no config at all and
+// every subsequent `nginx -t` failing.
+//
+// That is not hypothetical. On a 28-node cluster a single heartbeat round in
+// which the node is behind fires one pull per peer ahead, each ending in a
+// Generate; with ~300 servers to render the window is wide enough that the
+// collision is close to certain.
+var generateMu sync.Mutex
+
 type Generator struct {
 	OutputDir     string
 	CertStore     *cert.Store
 	NodeIP        string
 	WelcomeRoot   string
 	ChallengeRoot string
+
+	// stageDir, when set, is where files are actually written. OutputDir stays
+	// the path baked into the rendered config (the `include` directive), so the
+	// staged tree is already correct for its final location.
+	stageDir string
+}
+
+// writeRoot is the directory render* functions write into.
+func (g *Generator) writeRoot() string {
+	if g.stageDir != "" {
+		return g.stageDir
+	}
+	return g.OutputDir
 }
 
 func New(certStore *cert.Store, nodeIP string) *Generator {
@@ -41,6 +70,9 @@ func New(certStore *cert.Store, nodeIP string) *Generator {
 }
 
 func (g *Generator) Generate(ctx context.Context, db *sql.DB) error {
+	generateMu.Lock()
+	defer generateMu.Unlock()
+
 	state, err := g.collectState(ctx, db)
 	if err != nil {
 		return fmt.Errorf("collect state: %w", err)
@@ -53,12 +85,25 @@ func (g *Generator) Generate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("build policies: %w", err)
 	}
 
-	if err := os.RemoveAll(g.OutputDir); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove old config: %w", err)
+	// Render into a sibling staging directory and swap it in only once every
+	// file has been written. The old behaviour — wipe OutputDir, then spend
+	// hundreds of file writes rebuilding it — meant any failure part-way
+	// through (and any concurrent run) left the node with a half-built config
+	// and nginx unable to start. A failed Generate must leave the previously
+	// working config untouched.
+	//
+	// The staging dir is a sibling so the swap is a rename within one
+	// filesystem.
+	g.stageDir = g.OutputDir + ".staging"
+	defer func() { g.stageDir = "" }()
+
+	if err := os.RemoveAll(g.stageDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear staging dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(g.OutputDir, "servers"), 0755); err != nil {
-		return fmt.Errorf("mkdir output: %w", err)
+	if err := os.MkdirAll(filepath.Join(g.stageDir, "servers"), 0755); err != nil {
+		return fmt.Errorf("mkdir staging: %w", err)
 	}
+	defer os.RemoveAll(g.stageDir) // no-op once the swap has renamed it away
 
 	challengeFullDir := filepath.Join(g.ChallengeRoot, ".well-known", "acme-challenge")
 	if err := os.MkdirAll(challengeFullDir, 0755); err != nil {
@@ -89,6 +134,67 @@ func (g *Generator) Generate(ctx context.Context, db *sql.DB) error {
 		}
 		if err := g.renderDefault(port, proto, state); err != nil {
 			return fmt.Errorf("render default :%d: %w", port, err)
+		}
+	}
+
+	return g.swapInStaged()
+}
+
+// swapInStaged publishes the freshly-rendered staging tree into OutputDir by
+// renaming file by file, then deleting whatever the new render did not produce.
+//
+// The obvious implementation — rename OutputDir aside, rename staging into
+// place — is not usable here. rename(2) refuses to replace a non-empty
+// directory, so it takes two renames, and between them OutputDir does not
+// exist. Any `nginx -t` or reload landing in that window fails exactly the way
+// this whole change exists to prevent. Renaming individual files keeps the
+// directory in place throughout: every path is either its old contents or its
+// new contents, never absent.
+func (g *Generator) swapInStaged() error {
+	stagedServers := filepath.Join(g.stageDir, "servers")
+	liveServers := filepath.Join(g.OutputDir, "servers")
+
+	if err := os.MkdirAll(liveServers, 0755); err != nil {
+		return fmt.Errorf("ensure output dir: %w", err)
+	}
+
+	entries, err := os.ReadDir(stagedServers)
+	if err != nil {
+		return fmt.Errorf("read staged servers: %w", err)
+	}
+
+	published := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if err := os.Rename(filepath.Join(stagedServers, name), filepath.Join(liveServers, name)); err != nil {
+			return fmt.Errorf("publish %s: %w", name, err)
+		}
+		published[name] = true
+	}
+
+	// nginx.conf last: until it points at the new server set, the old one is
+	// still the coherent view.
+	if err := os.Rename(
+		filepath.Join(g.stageDir, "nginx.conf"),
+		filepath.Join(g.OutputDir, "nginx.conf"),
+	); err != nil {
+		return fmt.Errorf("publish nginx.conf: %w", err)
+	}
+
+	// Drop server confs this render did not produce (deleted domains).
+	live, err := os.ReadDir(liveServers)
+	if err != nil {
+		return fmt.Errorf("read live servers: %w", err)
+	}
+	for _, e := range live {
+		if e.IsDir() || published[e.Name()] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(liveServers, e.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale %s: %w", e.Name(), err)
 		}
 	}
 
@@ -260,7 +366,7 @@ func (g *Generator) renderMain(_ *generatorState) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.Create(filepath.Join(g.OutputDir, "nginx.conf"))
+	f, err := os.Create(filepath.Join(g.writeRoot(), "nginx.conf"))
 	if err != nil {
 		return err
 	}
@@ -306,7 +412,7 @@ func (g *Generator) renderServer(s serverEntry, st *generatorState, policy *Doma
 		return err
 	}
 	filename := fmt.Sprintf("domain-%s-%d.conf", sanitizeFilename(s.Host), s.Port)
-	f, err := os.Create(filepath.Join(g.OutputDir, "servers", filename))
+	f, err := os.Create(filepath.Join(g.writeRoot(), "servers", filename))
 	if err != nil {
 		return err
 	}
@@ -328,7 +434,7 @@ func (g *Generator) renderDefault(port int, proto string, st *generatorState) er
 		return err
 	}
 	filename := fmt.Sprintf("default-%d.conf", port)
-	f, err := os.Create(filepath.Join(g.OutputDir, "servers", filename))
+	f, err := os.Create(filepath.Join(g.writeRoot(), "servers", filename))
 	if err != nil {
 		return err
 	}

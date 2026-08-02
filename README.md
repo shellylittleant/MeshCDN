@@ -8,7 +8,8 @@ provider, without a central control plane, and without exposing any management
 interface to the public internet.
 
 > **Version note**
-> Current release: **v4.3.0**.
+> Current release: **v4.3.1**. Anyone running a cluster of more than a few
+> nodes should take this one — see the config-generation fix below.
 > This is **MeshCDN v4**, a complete ground-up rewrite in Go. Earlier v2.x/v3.x
 > lines were a different codebase; their documentation is preserved under the
 > release [`v3.1.0`](../../releases/tag/v3.1.0) for historical reference. v4
@@ -219,6 +220,20 @@ What's working:
   read-only/advisory
 - File-based config export/import via Telegram
 - Cluster-wide upgrades; `runtime/` rebuilt from `persistent/`
+
+New in v4.3.1:
+
+- **Config generation is no longer destroyed by concurrent syncs.** Every peer
+  reporting a higher `config_version` triggered its own snapshot pull, and the
+  heartbeat pings all peers concurrently — so on a large cluster one round
+  behind launched a pull per peer, each wiping and rebuilding the same nginx
+  directory at once. One would delete `nginx.conf` and then fail to remove
+  `servers/` ("directory not empty") because another was still writing into
+  it, leaving the node with no config and every later `nginx -t` failing.
+  Pulls are now single-flight, and config generation renders into a staging
+  directory and publishes file by file, so a failed or overlapping run leaves
+  the working config untouched. The symptom scales with cluster size: rare at
+  3 nodes, near-certain at 28.
 
 New in v4.3.0:
 
