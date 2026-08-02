@@ -74,9 +74,9 @@ cluster-wide config sync), but where every node is yours.
 
 ## Quick start (single node)
 
-The install script handles everything in one shot: installs Go if needed
-(with Chinese-mirror fallbacks), fetches dependencies, builds the binary, then
-installs OpenResty + systemd units. Tested on **Ubuntu 22.04+**.
+One command, three inputs: your bot token, your group id, and — when joining an
+existing cluster — the IP of any live node. No Go toolchain needed; the release
+ships a prebuilt binary. Tested on **Ubuntu 22.04+**.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shellylittleant/MeshCDN/main/scripts/quick-install.sh \
