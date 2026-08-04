@@ -110,7 +110,8 @@ func Exec(args []string) error {
 
 	batchText := joinArgs(args)
 
-	result, err := executor.ExecuteBatch(context.Background(), batchText)
+	execCtx := command.ContextWithLangFromDB(context.Background(), conn)
+	result, err := executor.ExecuteBatch(execCtx, batchText)
 	if err != nil {
 		return fmt.Errorf("execute: %w", err)
 	}

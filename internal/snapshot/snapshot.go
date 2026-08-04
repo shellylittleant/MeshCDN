@@ -137,6 +137,10 @@ func (e *Exporter) Export(ctx context.Context) (*Snapshot, error) {
 	if err := e.exportBotNode(ctx, snap); err != nil {
 		return nil, err
 	}
+	// 1c) Interface language — same reasoning as the bot-node override.
+	if err := e.exportLanguage(ctx, snap); err != nil {
+		return nil, err
+	}
 	// 2) Domains
 	if err := e.exportDomains(ctx, snap); err != nil {
 		return nil, err
@@ -183,6 +187,22 @@ func (e *Exporter) exportBotNode(ctx context.Context, snap *Snapshot) error {
 	if ip.Valid && ip.String != "" {
 		snap.Commands = append(snap.Commands,
 			fmt.Sprintf("/w internal set-bot %s", ip.String))
+	}
+	return nil
+}
+
+// exportLanguage emits the interface-language setting so it replays on a fresh
+// node and survives an upgrade, exactly like the bot-node override.
+func (e *Exporter) exportLanguage(ctx context.Context, snap *Snapshot) error {
+	var lang sql.NullString
+	err := e.DB.QueryRowContext(ctx,
+		`SELECT language FROM cluster_meta WHERE id = 1`).Scan(&lang)
+	if err != nil {
+		return nil // tolerate stripped test envs, as exportBotNode does
+	}
+	if lang.Valid && lang.String != "" {
+		snap.Commands = append(snap.Commands,
+			fmt.Sprintf("/w internal set-lang %s", lang.String))
 	}
 	return nil
 }

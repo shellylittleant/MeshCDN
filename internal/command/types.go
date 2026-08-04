@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/example/meshcdn/internal/i18n"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -64,6 +66,22 @@ type Command struct {
 	// Raw is the original command text, preserved for error messages
 	// and for export/snapshot regeneration.
 	Raw string
+
+	// Lang is the interface language this command's output should be rendered
+	// in. Populated by the executor from the request context; handlers read it
+	// via cmd.T(). The Handler interface takes no context, and adding one to
+	// every handler for a display concern would be the wrong trade — the
+	// language belongs to the request, and the Command *is* the request.
+	Lang i18n.Lang
+}
+
+// T renders a catalogue key in this command's language.
+func (c *Command) T(key string, args ...interface{}) string {
+	lang := c.Lang
+	if !lang.Valid() {
+		lang = i18n.Default
+	}
+	return i18n.T(lang, key, args...)
 }
 
 // Parse turns a single line of command text into a Command.
@@ -318,6 +336,10 @@ func (r Registry) Get(t string) (Handler, error) {
 // increment, and only successful commands are part of that version.
 // Failures are reported but do not abort the batch.
 type BatchResult struct {
+	// Lang is the interface language this batch was executed in, so
+	// FormatReport can render without needing the request context back.
+	Lang i18n.Lang
+
 	// NewVersion is the config_version after this batch.
 	// Equals OldVersion if all commands failed (no version bump).
 	NewVersion int64

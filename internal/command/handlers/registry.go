@@ -92,6 +92,7 @@ func NewRegistry(deps Dependencies) command.Registry {
 	r["sync"] = &SyncHandler{NotifyAll: deps.NotifyAll}
 	r["target"] = &TargetHandler{PeerMgr: deps.PeerMgr, LocalNodeIP: deps.LocalNodeIP}
 	r["upgrade"] = &UpgradeHandler{OnUpgrade: deps.OnUpgrade}
+	r["lang"] = &LangHandler{}
 	r["help"] = &HelpHandler{}
 	r["menu"] = &MenuHandler{}
 	r["confirm"] = &ConfirmHandler{PendingResolver: deps.PendingResolver}

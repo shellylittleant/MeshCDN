@@ -37,6 +37,7 @@ import (
 
 	"github.com/example/meshcdn/internal/command"
 	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/i18n"
 	"github.com/example/meshcdn/internal/peers"
 )
 
@@ -98,9 +99,25 @@ func (h *InternalHandler) Validate(cmd *command.Command) error {
 		}
 		return nil
 
+	case "set-lang":
+		// params: "<cn|en>" (set) or "-" (clear → default). Snapshot-replayable
+		// form of /v lang; the user-facing messaging lives in LangHandler.
+		fields := strings.Fields(cmd.Params)
+		if len(fields) < 1 {
+			return command.NewError(command.ErrBadParams,
+				"/w internal set-lang requires <cn|en> or -")
+		}
+		if fields[0] != "-" {
+			if _, ok := i18n.Parse(fields[0]); !ok {
+				return command.NewError(command.ErrBadParams,
+					fmt.Sprintf("unsupported language %q (expected cn / en)", fields[0]))
+			}
+		}
+		return nil
+
 	default:
 		return command.NewError(command.ErrBadFormat,
-			fmt.Sprintf("unknown internal op %q (expected peer-add / peer-remove)", op))
+			fmt.Sprintf("unknown internal op %q (expected peer-add / peer-remove / set-bot / set-lang)", op))
 	}
 }
 
@@ -176,6 +193,28 @@ func (h *InternalHandler) Write(tx *sql.Tx, cmd *command.Command) (command.Effec
 			msg = "bot 节点覆盖已清除 (回退到 join_order 默认)"
 		}
 		return command.Effects{UserMessage: msg}, nil
+
+	case "set-lang":
+		raw := fields[0]
+		lang := ""
+		if raw != "-" {
+			parsed, ok := i18n.Parse(raw)
+			if !ok {
+				return command.Effects{}, command.NewError(command.ErrBadParams,
+					fmt.Sprintf("unsupported language %q", raw))
+			}
+			lang = string(parsed)
+		}
+		if err := db.SetLanguage(context.Background(), tx, lang); err != nil {
+			return command.Effects{}, err
+		}
+		shown := lang
+		if shown == "" {
+			shown = string(i18n.Default)
+		}
+		return command.Effects{
+			UserMessage: fmt.Sprintf("interface language = %s", shown),
+		}, nil
 	}
 
 	return command.Effects{}, command.NewError(command.ErrBadFormat,

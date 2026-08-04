@@ -20,6 +20,7 @@ import (
 
 	"github.com/example/meshcdn/internal/command"
 	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/i18n"
 	"github.com/example/meshcdn/internal/logs"
 	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
@@ -91,7 +92,7 @@ func (h *ExportHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 	}
 
 	return command.Effects{
-		UserMessage: fmt.Sprintf("📤 配置 v%d — %d 条命令", ver, cmdCount),
+		UserMessage: cmd.T("export.caption", ver, cmdCount),
 		FileAttachment: &command.FileAttachment{
 			Filename: filename,
 			Content:  []byte(body),
@@ -155,22 +156,23 @@ func (h *StatusHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects,
 	botIP := effectiveBotIP(ctx, tx, h.PeerMgr)
 	botLabel := botIP
 	if botIP == "" {
-		botLabel = "(未知)"
+		botLabel = cmd.T("status.unknown")
 	} else if botIP == h.NodeIP {
-		botLabel = botIP + " (本节点)"
+		botLabel = botIP + " " + cmd.T("status.this_node")
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "MeshCDN 节点状态\n")
-	fmt.Fprintf(&sb, "  节点 IP:        %s\n", h.NodeIP)
-	fmt.Fprintf(&sb, "  bot 节点:       %s\n", botLabel)
-	fmt.Fprintf(&sb, "  程序版本:       %s\n", h.ProgramVersion)
-	fmt.Fprintf(&sb, "  config_version: %d\n", v)
-	fmt.Fprintf(&sb, "  集群节点数:     %d\n", peerCount)
-	fmt.Fprintf(&sb, "  域名规则:       %d\n", domainCount)
-	fmt.Fprintf(&sb, "  规则对象:       %d\n", ruleObjCount)
-	fmt.Fprintf(&sb, "  绑定关系:       %d\n", bindingCount)
-	fmt.Fprintf(&sb, "  当前时间:       %s\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(&sb, "%s\n", cmd.T("status.title"))
+	fmt.Fprintf(&sb, "  %s %s\n", i18n.PadRight(cmd.T("status.node_ip")+":", 20), h.NodeIP)
+	fmt.Fprintf(&sb, "  %s %s\n", i18n.PadRight(cmd.T("status.bot_node")+":", 20), botLabel)
+	fmt.Fprintf(&sb, "  %s %s\n", i18n.PadRight(cmd.T("status.program")+":", 20), h.ProgramVersion)
+	fmt.Fprintf(&sb, "  %s %d\n", i18n.PadRight(cmd.T("status.config_ver")+":", 20), v)
+	fmt.Fprintf(&sb, "  %s %d\n", i18n.PadRight(cmd.T("status.peer_count")+":", 20), peerCount)
+	fmt.Fprintf(&sb, "  %s %d\n", i18n.PadRight(cmd.T("status.domains")+":", 20), domainCount)
+	fmt.Fprintf(&sb, "  %s %d\n", i18n.PadRight(cmd.T("status.rule_objs")+":", 20), ruleObjCount)
+	fmt.Fprintf(&sb, "  %s %d\n", i18n.PadRight(cmd.T("status.bindings")+":", 20), bindingCount)
+	fmt.Fprintf(&sb, "  %s %s\n", i18n.PadRight(cmd.T("status.language")+":", 20), cmd.Lang.DisplayName())
+	fmt.Fprintf(&sb, "  %s %s\n", i18n.PadRight(cmd.T("status.now")+":", 20), time.Now().UTC().Format(time.RFC3339))
 
 	return command.Effects{UserMessage: sb.String()}, nil
 }
@@ -265,7 +267,7 @@ func (h *NodesHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 	}
 
 	botIP := effectiveBotIP(context.Background(), tx, h.PeerMgr)
-	fmt.Fprintf(&sb, "集群节点 (%d)  ⭐=bot:\n", len(all))
+	fmt.Fprintf(&sb, "%s\n", cmd.T("nodes.title", len(all)))
 	for _, p := range all {
 		mark := "  "
 		if p.IP == botIP {
@@ -277,16 +279,16 @@ func (h *NodesHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 			if st.LastRTT > 0 {
 				rttStr = st.LastRTT.String()
 			}
-			status := "online"
+			status := cmd.T("nodes.online")
 			if st.ConsecutiveFailures >= 3 {
-				status = "offline"
+				status = cmd.T("nodes.offline")
 			} else if st.ConsecutiveFailures > 0 {
 				status = "degraded"
 			}
 			fmt.Fprintf(&sb, "%s [%d] %-15s  v%-4d  rtt=%-10s  %s\n",
 				mark, p.JoinOrder, p.IP, st.ConfigVersion, rttStr, status)
 		} else {
-			fmt.Fprintf(&sb, "%s [%d] %-15s  (local or no data)\n", mark, p.JoinOrder, p.IP)
+			fmt.Fprintf(&sb, "%s [%d] %-15s  %s\n", mark, p.JoinOrder, p.IP, cmd.T("nodes.no_data"))
 		}
 	}
 
@@ -332,7 +334,7 @@ func (h *StatsHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects
 func (h *StatsHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
 	if h.Store == nil {
 		return command.Effects{
-			UserMessage: "stats: 未启用 (本节点未运行日志采集，需 serve 模式 + nginx)",
+			UserMessage: cmd.T("stats.disabled"),
 		}, nil
 	}
 	ctx := context.Background()
@@ -352,11 +354,11 @@ func (h *StatsHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 
 	scopeLabel := domain
 	if scopeLabel == "" {
-		scopeLabel = "全部域名"
+		scopeLabel = cmd.T("stats.all_domains")
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "📊 流量统计 (%s, 近 %s, 本节点)\n", scopeLabel, humanWindow(window))
+	fmt.Fprintf(&sb, "%s\n", cmd.T("stats.title", scopeLabel, humanWindow(window)))
 
 	var totalHits, totalBytes int64
 	for _, r := range rows {
@@ -364,13 +366,13 @@ func (h *StatsHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 		totalBytes += r.Bytes
 	}
 	if totalHits == 0 {
-		sb.WriteString("  (窗口内无数据)\n")
+		sb.WriteString(cmd.T("stats.no_data") + "\n")
 		return command.Effects{UserMessage: sb.String()}, nil
 	}
 
-	fmt.Fprintf(&sb, "  总请求: %d\n", totalHits)
-	fmt.Fprintf(&sb, "  总流量: %s\n", humanBytes(totalBytes))
-	sb.WriteString("  状态码分布:\n")
+	fmt.Fprintf(&sb, "%s\n", cmd.T("stats.total_hits", totalHits))
+	fmt.Fprintf(&sb, "%s\n", cmd.T("stats.total_bytes", humanBytes(totalBytes)))
+	sb.WriteString(cmd.T("stats.by_status") + "\n")
 	for _, r := range rows {
 		fmt.Fprintf(&sb, "    %d: %d (%.1f%%)\n",
 			r.Status, r.Hits, 100*float64(r.Hits)/float64(totalHits))
@@ -379,9 +381,9 @@ func (h *StatsHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, 
 	if domain == "" {
 		tops, err := h.Store.TopDomains(ctx, since, 10)
 		if err == nil && len(tops) > 0 {
-			sb.WriteString("  域名 Top:\n")
+			sb.WriteString(cmd.T("stats.top_domains") + "\n")
 			for _, t := range tops {
-				fmt.Fprintf(&sb, "    %-24s %d 次  %s\n", t.Domain, t.Hits, humanBytes(t.Bytes))
+				fmt.Fprintf(&sb, "    %-24s %d %s  %s\n", t.Domain, t.Hits, cmd.T("stats.hits_unit"), humanBytes(t.Bytes))
 			}
 		}
 	}

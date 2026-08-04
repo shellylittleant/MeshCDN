@@ -8,9 +8,8 @@ provider, without a central control plane, and without exposing any management
 interface to the public internet.
 
 > **Version note**
-> Current release: **v4.3.2**. Anyone running a cluster of more than a few
-> nodes should take this one — see the config-generation and membership fixes
-> below.
+> Current release: **v4.4.0** — the interface now speaks English. Send `/en`
+> or `/cn` in the group to switch; the setting syncs across the cluster.
 >
 > This is **MeshCDN v4**, a complete ground-up rewrite in Go. Earlier v2.x/v3.x
 > lines were a different codebase; their documentation is preserved under the
@@ -234,6 +233,23 @@ What's working:
   read-only/advisory
 - File-based config export/import via Telegram
 - Cluster-wide upgrades; `runtime/` rebuilt from `persistent/`
+
+New in v4.4.0:
+
+- **Bilingual interface (English / 中文).** `/en` and `/cn` switch the language
+  of menus, help, status output, traffic reports and error categories. The
+  setting lives in `cluster_meta` and rides the normal config stream, so it
+  survives a bot-role transfer — whichever node ends up polling Telegram speaks
+  the language you chose — and replays from the snapshot after an upgrade.
+  *Command syntax is never translated:* `/w domain …` is identical in both
+  languages, because the command language is the product and the terminal is
+  only a shell over it.
+- **Bare-verb shortcuts in Telegram.** `/help`, `/sync`, `/status`, `/nodes`,
+  `/stats`, `/export`, `/upgrade`, `/en`, `/cn` now work without the
+  four-segment form. V4-DESIGN listed these all along but only `/menu` was ever
+  implemented; every other bare verb failed with "command must have 4 segments".
+  Expansion happens in the bot layer, so the core grammar stays strict and the
+  CLI still takes the full form.
 
 New in v4.3.2:
 

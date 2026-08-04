@@ -9,6 +9,7 @@ package command
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/example/meshcdn/internal/cert"
 	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/i18n"
 	"github.com/example/meshcdn/internal/nginx"
 	"github.com/example/meshcdn/internal/peers"
 	"github.com/example/meshcdn/internal/snapshot"
@@ -91,6 +93,10 @@ func (e *Executor) ExecuteBatch(ctx context.Context, batchText string) (*BatchRe
 			parseErrors[i] = err
 			continue
 		}
+		// Stamp the request language once, here, so every handler renders in
+		// the same language for the whole batch even if the batch itself
+		// changes the setting.
+		cmd.Lang = LangFrom(ctx)
 		parsedCmds[i] = cmd
 	}
 
@@ -106,6 +112,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, batchText string) (*BatchRe
 	}
 
 	result := &BatchResult{
+		Lang:       LangFrom(ctx),
 		OldVersion: oldVersion,
 		NewVersion: oldVersion,
 		Outcomes:   make([]CommandOutcome, len(lines)),
@@ -536,6 +543,16 @@ func splitLines(s string) []string {
 	return strings.Split(s, "\n")
 }
 
+// codeOf extracts a CommandError's stable short code, or INTERNAL for plain
+// errors that never went through the classification.
+func codeOf(err error) string {
+	var ce CommandError
+	if errors.As(err, &ce) {
+		return ce.Code()
+	}
+	return ErrInternal
+}
+
 func FormatReport(r *BatchResult) string {
 	var sb strings.Builder
 
@@ -548,22 +565,28 @@ func FormatReport(r *BatchResult) string {
 		}
 	}
 
+	lang := r.Lang
+	if !lang.Valid() {
+		lang = i18n.Default
+	}
+
 	if successes > 0 && failures == 0 {
-		fmt.Fprintf(&sb, "✅ %d 条命令成功执行 (config_version: %d → %d)\n",
-			successes, r.OldVersion, r.NewVersion)
+		sb.WriteString(i18n.T(lang, "report.all_ok", successes, r.OldVersion, r.NewVersion) + "\n")
 	} else if successes > 0 && failures > 0 {
-		fmt.Fprintf(&sb, "⚠️  %d 条成功, %d 条失败 (config_version: %d → %d)\n",
-			successes, failures, r.OldVersion, r.NewVersion)
+		sb.WriteString(i18n.T(lang, "report.partial", successes, failures, r.OldVersion, r.NewVersion) + "\n")
 	} else if failures > 0 {
-		fmt.Fprintf(&sb, "❌ %d 条命令全部失败 (config_version 未变: %d)\n",
-			failures, r.OldVersion)
+		sb.WriteString(i18n.T(lang, "report.all_failed", failures, r.OldVersion) + "\n")
 	} else {
-		sb.WriteString("(空批处理)\n")
+		sb.WriteString(i18n.T(lang, "report.empty") + "\n")
 	}
 
 	for i, o := range r.Outcomes {
 		if o.Err != nil {
-			fmt.Fprintf(&sb, "  L%d 失败: %v\n", i+1, o.Err)
+			// Lead with the translated error *category*. Handler messages are
+			// still being migrated to the catalogue, so this guarantees an
+			// English reader always gets at least the class of failure.
+			label := i18n.T(lang, "err."+codeOf(o.Err))
+			sb.WriteString(i18n.T(lang, "report.line_failed", i+1, label, o.Err) + "\n")
 		} else if o.Command != nil && o.Effects.UserMessage != "" {
 			fmt.Fprintf(&sb, "  L%d %s: %s\n", i+1, o.Command.Verb, o.Effects.UserMessage)
 		}

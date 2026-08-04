@@ -265,6 +265,10 @@ func (c *Client) detectAITrigger(msg *models.Message) (mentioned, isReplyToMe bo
 
 // handleTextCommand processes a /-prefixed command.
 func (c *Client) handleTextCommand(ctx context.Context, b *tgbot.Bot, msg *models.Message, text string) {
+	// Resolve the interface language once, before anything renders — the menu
+	// needs it too, and it is a single indexed read on a one-row table.
+	ctx = command.ContextWithLangFromDB(ctx, c.Executor.DB)
+
 	// Special: /menu shortcuts
 	if strings.HasPrefix(text, "/menu") {
 		rest := strings.TrimSpace(strings.TrimPrefix(text, "/menu"))
@@ -272,9 +276,16 @@ func (c *Client) handleTextCommand(ctx context.Context, b *tgbot.Bot, msg *model
 		return
 	}
 
+	// Bare-verb aliases (/en, /sync, /help …) expand to the four-segment form
+	// here, in the terminal, so the core grammar stays strict. Multi-line
+	// batches are left alone: they are already full commands.
+	if !strings.Contains(text, "\n") {
+		text = expandAlias(text)
+	}
+
 	result, err := c.Executor.ExecuteBatch(ctx, text)
 	if err != nil {
-		c.replyTo(ctx, msg, fmt.Sprintf("❌ 执行失败: %v", err))
+		c.replyTo(ctx, msg, command.T(ctx, "err.exec_failed", err))
 		return
 	}
 
@@ -287,8 +298,8 @@ func (c *Client) handleTextCommand(ctx context.Context, b *tgbot.Bot, msg *model
 			caption = "📤 " + att.Filename
 		}
 		if err := c.replyWithFile(ctx, msg, att.Filename, att.Content, caption); err != nil {
-			c.replyTo(ctx, msg, fmt.Sprintf("❌ 文件发送失败: %v\n\n%s",
-				err, command.FormatReport(result)))
+			c.replyTo(ctx, msg, command.T(ctx, "err.file_send_failed", err)+
+				"\n\n"+command.FormatReport(result))
 			return
 		}
 		c.maybeRegisterPending(result, text)

@@ -24,6 +24,7 @@ import (
 
 	"github.com/example/meshcdn/internal/command"
 	"github.com/example/meshcdn/internal/db"
+	"github.com/example/meshcdn/internal/i18n"
 	"github.com/example/meshcdn/internal/peers"
 )
 
@@ -221,46 +222,8 @@ func (h *HelpHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects,
 	return command.Effects{}, command.NewError(command.ErrBadFormat, "use /v help")
 }
 func (h *HelpHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
-	return command.Effects{UserMessage: helpText}, nil
+	return command.Effects{UserMessage: cmd.T("help.text")}, nil
 }
-
-const helpText = `MeshCDN 命令参考
-
-格式: /<verb> <type> <scope> <params>   (严格四段式，空位用 - 占位)
-
-A 类 - 直接命令
-  /w domain   <host:port>       <origin>             写入域名
-  /w ssl      <域名/IP>          -                    申请 LE 证书
-  /w sslfile  <域名/IP>          -                    上传证书 (env vars)
-  /d <type>   <scope>           <params>             删除 (与 /w 镜像)
-
-B 类 - 对象命令 (step 6)
-  /w cache    <名字>            <key=value...>      定义缓存对象
-  /v cache    -                 purge-all           清空全集群缓存并 reload
-  /v cache    -                 purge-node          仅清空本节点缓存
-  /w defense  <名字>            <key=value...>      定义防御对象
-  /w redirect <名字>            <key=value...>      定义重定向对象
-  /w header   <名字>            <key=value...>      定义头部对象
-
-C 类 - 绑定命令 (step 6)
-  /w bind     <域名/IP>          <对象类型>:<对象名>
-
-V 类 - 查询命令
-  /v <type>   <scope|->         <params|->          查询规则
-  /v export   -                 -                    导出全集群配置
-  /v status   -                 -                    本节点状态
-  /v nodes    [<peer-ip>|-]     -                    peer 列表/详情
-  /v stats    [<域名>|-]        [<窗口>|-]           流量统计 (本节点; 窗口如 24h/7d, 默认 24h)
-
-系统动作 (read-shaped, 用 /v 调用)
-  /v sync     -                 -                    强制同步给所有 peer
-  /v target   <peer-ip>         -                    转移 bot 角色 (重启后生效)
-  /v upgrade  -                 -                    触发集群升级
-  /v help     -                 -                    本帮助
-  /v menu     -                 -                    主菜单 (Telegram 用)
-  /v confirm  <ID>              -                    二次确认 (危险操作)
-
-详细文档: V4-DESIGN.md`
 
 // ─────────────────────────────────────────────────────────────────────
 // /v menu - - - — Telegram main menu (stub)
@@ -284,7 +247,7 @@ func (h *MenuHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects,
 }
 func (h *MenuHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
 	return command.Effects{
-		UserMessage: "💡 在 Telegram 群里发 /menu (不带占位符) 显示带按钮的主菜单。\nCLI 模式下查看完整命令: /v help - -",
+		UserMessage: cmd.T("menu.cli_hint"),
 	}, nil
 }
 
@@ -329,6 +292,90 @@ func (h *ConfirmHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects
 		return command.Effects{}, err
 	}
 	return command.Effects{
-		UserMessage: fmt.Sprintf("确认完成: %s", cmd.Scope),
+		UserMessage: cmd.T("confirm.done", cmd.Scope),
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// /v lang <cn|en> - — switch the interface language, cluster-wide
+// ─────────────────────────────────────────────────────────────────────
+
+// LangHandler changes the language MeshCDN speaks to its operator.
+//
+// Like /v target this is read-shaped — it configures the control surface, not
+// the CDN — but it must still reach every node, so it sets ForceVersionBump and
+// rides the normal config stream. Storing it cluster-wide rather than per-node
+// is what makes the setting survive a bot-role transfer: whichever node ends up
+// polling Telegram speaks the language the operator picked.
+//
+// The command *language* is never translated; only the prose around it. See
+// V4-DESIGN §0.2 — the instruction set is the product, the terminal is a shell.
+type LangHandler struct{}
+
+func (h *LangHandler) Type() string { return "lang" }
+
+func (h *LangHandler) PrimaryKey(s, p string) (string, error) { return "lang", nil }
+
+func (h *LangHandler) Validate(cmd *command.Command) error {
+	if cmd.Verb != command.VerbView {
+		return command.NewError(command.ErrBadFormat, "use /v lang <cn|en> -")
+	}
+	// Bare `/v lang - -` reports the current setting.
+	if command.IsPlaceholder(cmd.Scope) {
+		return nil
+	}
+	if _, ok := i18n.Parse(cmd.Scope); !ok {
+		return command.NewError(command.ErrBadParams,
+			fmt.Sprintf("unsupported language %q (expected cn / en)", cmd.Scope))
+	}
+	return nil
+}
+
+func (h *LangHandler) Write(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
+	return command.Effects{}, command.NewError(command.ErrBadFormat, "use /v lang")
+}
+
+func (h *LangHandler) Delete(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
+	return command.Effects{}, command.NewError(command.ErrBadFormat, "use /v lang")
+}
+
+func (h *LangHandler) View(tx *sql.Tx, cmd *command.Command) (command.Effects, error) {
+	ctx := context.Background()
+
+	stored, _ := db.GetLanguage(ctx, tx)
+	current := i18n.Default
+	if parsed, ok := i18n.Parse(stored); ok {
+		current = parsed
+	}
+
+	// Report-only form.
+	if command.IsPlaceholder(cmd.Scope) {
+		return command.Effects{
+			UserMessage: i18n.T(current, "lang.current", current.DisplayName()),
+		}, nil
+	}
+
+	target, ok := i18n.Parse(cmd.Scope)
+	if !ok {
+		return command.Effects{}, command.NewError(command.ErrBadParams,
+			i18n.T(current, "lang.unknown", cmd.Scope))
+	}
+
+	if target == current {
+		return command.Effects{
+			UserMessage: i18n.T(current, "lang.unchanged", current.DisplayName()),
+		}, nil
+	}
+
+	if err := db.SetLanguage(ctx, tx, string(target)); err != nil {
+		return command.Effects{}, err
+	}
+
+	// Confirmation is rendered in the NEW language — the operator asked for it,
+	// and it doubles as immediate proof the switch took effect.
+	return command.Effects{
+		ForceVersionBump: true,
+		UserMessage: i18n.T(target, "lang.switched", target.DisplayName()) +
+			"\n" + i18n.T(target, "lang.hint_after"),
 	}, nil
 }

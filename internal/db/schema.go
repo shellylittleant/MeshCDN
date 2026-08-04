@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS cluster_meta (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     config_version  INTEGER NOT NULL DEFAULT 0,
     bot_node_ip     TEXT,
-    program_version TEXT
+    program_version TEXT,
+    language        TEXT
 );
 INSERT OR IGNORE INTO cluster_meta (id, config_version) VALUES (1, 0);
 
@@ -155,6 +156,19 @@ func migrate(conn *sql.DB) error {
 			return fmt.Errorf("backfill display_scope: %w", err)
 		}
 	}
+	// v4.4.0: cluster_meta gained `language` (interface language, synced
+	// cluster-wide the same way bot_node_ip is).
+	hasLanguage, err := columnExists(ctx, conn, "cluster_meta", "language")
+	if err != nil {
+		return err
+	}
+	if !hasLanguage {
+		if _, err := conn.ExecContext(ctx,
+			`ALTER TABLE cluster_meta ADD COLUMN language TEXT`); err != nil {
+			return fmt.Errorf("add language column: %w", err)
+		}
+	}
+
 	// Always create the index (idempotent via IF NOT EXISTS). Whether the
 	// column was just added or existed all along, we need the index either way.
 	if _, err := conn.ExecContext(ctx,
@@ -232,6 +246,34 @@ func SetBotNodeIP(ctx context.Context, tx *sql.Tx, ip string) error {
 		"UPDATE cluster_meta SET bot_node_ip = ? WHERE id = 1", val,
 	); err != nil {
 		return fmt.Errorf("set bot_node_ip: %w", err)
+	}
+	return nil
+}
+
+// GetLanguage reads cluster_meta.language. Empty string means "never set" —
+// callers fall back to i18n.Default. Synced cluster-wide so the interface
+// language survives a bot-role transfer (V4-DESIGN §5.3): whichever node ends
+// up talking to Telegram speaks the language the operator chose.
+func GetLanguage(ctx context.Context, q Querier) (string, error) {
+	var lang sql.NullString
+	err := q.QueryRowContext(ctx, "SELECT language FROM cluster_meta WHERE id = 1").Scan(&lang)
+	if err != nil {
+		return "", fmt.Errorf("read language: %w", err)
+	}
+	return lang.String, nil
+}
+
+// SetLanguage sets (or, with lang=="", clears) the interface language.
+// Runs inside the batch tx so the version bump and snapshot export capture it.
+func SetLanguage(ctx context.Context, tx *sql.Tx, lang string) error {
+	var val interface{}
+	if lang != "" {
+		val = lang
+	} // else nil → SQL NULL (back to default)
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE cluster_meta SET language = ? WHERE id = 1", val,
+	); err != nil {
+		return fmt.Errorf("set language: %w", err)
 	}
 	return nil
 }
